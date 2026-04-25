@@ -1,0 +1,12 @@
+[package]
+name = "openapi-modelgen"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+openapiv3 = "2"
+serde_yaml = "0.9"
+
+[dev-dependencies]
+pretty_assertions = "1"

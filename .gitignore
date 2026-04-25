@@ -1,0 +1,27 @@
+# Rust
+**/target
+**/*.rs.bk
+*.pdb
+
+# Nix
+/result
+/result-*
+
+# Editor/IDE
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude code
+.claude/
+
+# Direnv
+.direnv/
+.envrc
