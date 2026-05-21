@@ -4,6 +4,14 @@ use crate::{
     Config, Constraints, Entity, EntityKind, EnumDef, Field, GeneratedCrate, GeneratedFile,
 };
 
+/// Rust strict keywords that must be escaped with `r#` when used as identifiers.
+const RUST_KEYWORDS: &[&str] = &[
+    "as", "async", "await", "break", "const", "continue", "crate", "dyn", "else", "enum", "extern",
+    "false", "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub",
+    "ref", "return", "self", "Self", "static", "struct", "super", "trait", "true", "type",
+    "unsafe", "use", "where", "while",
+];
+
 /// Generate a complete crate from a list of parsed entities.
 pub fn write(entities: &[Entity], config: &Config) -> Result<GeneratedCrate, std::fmt::Error> {
     let needs_regex = entities.iter().any(|e| {
@@ -131,7 +139,11 @@ use serde::{{Deserialize, Serialize}};{uuid_import}
             } else {
                 resolved_type
             };
-            writeln!(out, "    pub {}: {final_type},", field.name)?;
+            writeln!(
+                out,
+                "    pub {}: {final_type},",
+                escape_keyword(&field.name)
+            )?;
         }
         writeln!(out, "}}")?;
     }
@@ -248,13 +260,14 @@ fn write_error_push(out: &mut String, indent: &str, fmt_str: &str, args: &str) -
 /// Write the validation checks for a single field inside a `validate()` body.
 fn write_field_checks(out: &mut String, field: &Field) -> std::fmt::Result {
     let name = &field.name;
+    let ident = escape_keyword(name);
 
     // For optional fields, wrap in `if let Some`
     let (accessor, indent) = if field.is_optional {
-        writeln!(out, "        if let Some(val) = &self.{name} {{")?;
+        writeln!(out, "        if let Some(val) = &self.{ident} {{")?;
         ("(*val)".to_string(), "            ")
     } else {
-        (format!("self.{name}"), "        ")
+        (format!("self.{ident}"), "        ")
     };
 
     match &field.constraints {
@@ -596,6 +609,15 @@ pub use model::*;
 pub use validation::{{Validation, ValidationError}};
 "
     )
+}
+
+/// Escape a name with `r#` if it is a Rust keyword.
+fn escape_keyword(name: &str) -> String {
+    if RUST_KEYWORDS.contains(&name) {
+        format!("r#{name}")
+    } else {
+        name.to_string()
+    }
 }
 
 #[cfg(test)]
