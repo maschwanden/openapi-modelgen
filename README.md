@@ -125,7 +125,7 @@ pub struct CreateGreetingRequest {
 }
 ```
 
-You use them directly in your handlers, e.g. ith axum:
+You use them directly in your handlers, e.g. with axum:
 
 ```rust
 use hello_world_openapi::{CreateGreetingRequest, Greeting, Validation};
