@@ -11,6 +11,7 @@ use clap::Parser;
 use openapi_modelgen::{Config, generate, load_spec};
 
 #[derive(Parser)]
+#[command(version)]
 struct Args {
     /// Path to the OpenAPI YAML spec
     #[arg(long)]
