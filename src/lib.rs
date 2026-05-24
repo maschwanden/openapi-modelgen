@@ -161,6 +161,60 @@ impl Constraints {
             Constraints::Nested | Constraints::VecNested => true,
         }
     }
+
+    /// Number of independent validation checks this constraint will emit.
+    pub(crate) fn n_checks(&self) -> usize {
+        match self {
+            Constraints::None => 0,
+            Constraints::String {
+                min_length,
+                max_length,
+                pattern,
+                enumeration,
+            } => [
+                min_length.is_some(),
+                max_length.is_some(),
+                pattern.is_some(),
+                !enumeration.is_empty(),
+            ]
+            .iter()
+            .filter(|&&x| x)
+            .count(),
+            Constraints::Integer {
+                minimum,
+                maximum,
+                multiple_of,
+                enumeration,
+                ..
+            } => [
+                minimum.is_some(),
+                maximum.is_some(),
+                multiple_of.is_some(),
+                !enumeration.is_empty(),
+            ]
+            .iter()
+            .filter(|&&x| x)
+            .count(),
+            Constraints::Number {
+                minimum,
+                maximum,
+                multiple_of,
+                ..
+            } => [minimum.is_some(), maximum.is_some(), multiple_of.is_some()]
+                .iter()
+                .filter(|&&x| x)
+                .count(),
+            Constraints::Array {
+                min_items,
+                max_items,
+                unique_items,
+            } => [min_items.is_some(), max_items.is_some(), *unique_items]
+                .iter()
+                .filter(|&&x| x)
+                .count(),
+            Constraints::Nested | Constraints::VecNested => 1,
+        }
+    }
 }
 
 /// Load an OpenAPI spec from a YAML string.

@@ -257,17 +257,68 @@ fn write_error_push(out: &mut String, indent: &str, fmt_str: &str, args: &str) -
     writeln!(out, "{indent}    ));")
 }
 
+/// Returns true when this constraint produces exactly one `if`-style check that
+/// clippy would flag as collapsible with an outer `if let Some`.
+fn is_single_collapsible_check(constraints: &Constraints) -> bool {
+    // VecNested emits a `for` loop, Array unique_items emits a block — neither is collapsible.
+    let non_collapsible = matches!(constraints, Constraints::VecNested)
+        || matches!(
+            constraints,
+            Constraints::Array {
+                unique_items: true,
+                min_items: None,
+                max_items: None,
+                ..
+            }
+        );
+    !non_collapsible && constraints.n_checks() == 1
+}
+
+/// Open a check: either a plain `if condition {` or a collapsed
+/// `if let Some(val) = &self.field\n    && condition\n{`.
+fn write_check_open(
+    out: &mut String,
+    indent: &str,
+    condition: &str,
+    guard: Option<&str>,
+) -> std::fmt::Result {
+    if let Some(guard) = guard {
+        writeln!(out, "{indent}{guard}")?;
+        writeln!(out, "{indent}    && {condition}")?;
+        writeln!(out, "{indent}{{")
+    } else {
+        writeln!(out, "{indent}if {condition} {{")
+    }
+}
+
 /// Write the validation checks for a single field inside a `validate()` body.
 fn write_field_checks(out: &mut String, field: &Field) -> std::fmt::Result {
     let name = &field.name;
     let field_ident = escape_keyword(name);
 
-    // For optional fields, wrap in `if let Some`
+    let collapsed = field.is_optional && is_single_collapsible_check(&field.constraints);
+
+    // For optional fields, wrap in `if let Some` (unless collapsed into a single check)
     let (accessor, indent) = if field.is_optional {
-        writeln!(out, "        if let Some(val) = &self.{field_ident} {{")?;
-        ("(*val)".to_string(), "            ")
+        if !collapsed {
+            writeln!(out, "        if let Some(val) = &self.{field_ident} {{")?;
+        }
+        (
+            "(*val)".to_string(),
+            if collapsed {
+                "        "
+            } else {
+                "            "
+            },
+        )
     } else {
         (format!("self.{field_ident}"), "        ")
+    };
+
+    let guard = if collapsed {
+        Some(format!("if let Some(val) = &self.{field_ident}"))
+    } else {
+        None
     };
 
     match &field.constraints {
@@ -278,7 +329,12 @@ fn write_field_checks(out: &mut String, field: &Field) -> std::fmt::Result {
             enumeration,
         } => {
             if let Some(min) = min_length {
-                writeln!(out, "{indent}if {accessor}.chars().count() < {min} {{")?;
+                write_check_open(
+                    out,
+                    indent,
+                    &format!("{accessor}.chars().count() < {min}"),
+                    guard.as_deref(),
+                )?;
                 write_error_push(
                     out,
                     indent,
@@ -288,7 +344,12 @@ fn write_field_checks(out: &mut String, field: &Field) -> std::fmt::Result {
                 writeln!(out, "{indent}}}")?;
             }
             if let Some(max) = max_length {
-                writeln!(out, "{indent}if {accessor}.chars().count() > {max} {{")?;
+                write_check_open(
+                    out,
+                    indent,
+                    &format!("{accessor}.chars().count() > {max}"),
+                    guard.as_deref(),
+                )?;
                 write_error_push(
                     out,
                     indent,
@@ -299,9 +360,11 @@ fn write_field_checks(out: &mut String, field: &Field) -> std::fmt::Result {
             }
             if let Some(pat) = pattern {
                 let escaped = pat.replace('\\', "\\\\").replace('"', "\\\"");
-                writeln!(
+                write_check_open(
                     out,
-                    "{indent}if !Regex::new(\"{escaped}\").unwrap().is_match(&{accessor}) {{"
+                    indent,
+                    &format!("!Regex::new(\"{escaped}\").unwrap().is_match(&{accessor})"),
+                    guard.as_deref(),
                 )?;
                 write_error_push(
                     out,
@@ -315,9 +378,11 @@ fn write_field_checks(out: &mut String, field: &Field) -> std::fmt::Result {
                 let values: Vec<String> = enumeration.iter().map(|v| format!("\"{v}\"")).collect();
                 let joined = values.join(", ");
                 let allowed_display = enumeration.join(", ");
-                writeln!(
+                write_check_open(
                     out,
-                    "{indent}if ![{joined}].contains(&{accessor}.as_str()) {{"
+                    indent,
+                    &format!("![{joined}].contains(&{accessor}.as_str())"),
+                    guard.as_deref(),
                 )?;
                 write_error_push(
                     out,
@@ -338,7 +403,12 @@ fn write_field_checks(out: &mut String, field: &Field) -> std::fmt::Result {
         } => {
             if let Some(min) = minimum {
                 if *exclusive_minimum {
-                    writeln!(out, "{indent}if {accessor} <= {min} {{")?;
+                    write_check_open(
+                        out,
+                        indent,
+                        &format!("{accessor} <= {min}"),
+                        guard.as_deref(),
+                    )?;
                     write_error_push(
                         out,
                         indent,
@@ -347,7 +417,12 @@ fn write_field_checks(out: &mut String, field: &Field) -> std::fmt::Result {
                     )?;
                     writeln!(out, "{indent}}}")?;
                 } else {
-                    writeln!(out, "{indent}if {accessor} < {min} {{")?;
+                    write_check_open(
+                        out,
+                        indent,
+                        &format!("{accessor} < {min}"),
+                        guard.as_deref(),
+                    )?;
                     write_error_push(
                         out,
                         indent,
@@ -359,7 +434,12 @@ fn write_field_checks(out: &mut String, field: &Field) -> std::fmt::Result {
             }
             if let Some(max) = maximum {
                 if *exclusive_maximum {
-                    writeln!(out, "{indent}if {accessor} >= {max} {{")?;
+                    write_check_open(
+                        out,
+                        indent,
+                        &format!("{accessor} >= {max}"),
+                        guard.as_deref(),
+                    )?;
                     write_error_push(
                         out,
                         indent,
@@ -368,7 +448,12 @@ fn write_field_checks(out: &mut String, field: &Field) -> std::fmt::Result {
                     )?;
                     writeln!(out, "{indent}}}")?;
                 } else {
-                    writeln!(out, "{indent}if {accessor} > {max} {{")?;
+                    write_check_open(
+                        out,
+                        indent,
+                        &format!("{accessor} > {max}"),
+                        guard.as_deref(),
+                    )?;
                     write_error_push(
                         out,
                         indent,
@@ -379,7 +464,12 @@ fn write_field_checks(out: &mut String, field: &Field) -> std::fmt::Result {
                 }
             }
             if let Some(mult) = multiple_of {
-                writeln!(out, "{indent}if {accessor} % {mult} != 0 {{")?;
+                write_check_open(
+                    out,
+                    indent,
+                    &format!("{accessor} % {mult} != 0"),
+                    guard.as_deref(),
+                )?;
                 write_error_push(
                     out,
                     indent,
@@ -391,7 +481,12 @@ fn write_field_checks(out: &mut String, field: &Field) -> std::fmt::Result {
             if !enumeration.is_empty() {
                 let values: Vec<String> = enumeration.iter().map(|v| format!("{v}")).collect();
                 let joined = values.join(", ");
-                writeln!(out, "{indent}if ![{joined}].contains(&{accessor}) {{")?;
+                write_check_open(
+                    out,
+                    indent,
+                    &format!("![{joined}].contains(&{accessor})"),
+                    guard.as_deref(),
+                )?;
                 write_error_push(
                     out,
                     indent,
@@ -410,7 +505,12 @@ fn write_field_checks(out: &mut String, field: &Field) -> std::fmt::Result {
         } => {
             if let Some(min) = minimum {
                 if *exclusive_minimum {
-                    writeln!(out, "{indent}if {accessor} <= {min}_f64 {{")?;
+                    write_check_open(
+                        out,
+                        indent,
+                        &format!("{accessor} <= {min}_f64"),
+                        guard.as_deref(),
+                    )?;
                     write_error_push(
                         out,
                         indent,
@@ -419,7 +519,12 @@ fn write_field_checks(out: &mut String, field: &Field) -> std::fmt::Result {
                     )?;
                     writeln!(out, "{indent}}}")?;
                 } else {
-                    writeln!(out, "{indent}if {accessor} < {min}_f64 {{")?;
+                    write_check_open(
+                        out,
+                        indent,
+                        &format!("{accessor} < {min}_f64"),
+                        guard.as_deref(),
+                    )?;
                     write_error_push(
                         out,
                         indent,
@@ -431,7 +536,12 @@ fn write_field_checks(out: &mut String, field: &Field) -> std::fmt::Result {
             }
             if let Some(max) = maximum {
                 if *exclusive_maximum {
-                    writeln!(out, "{indent}if {accessor} >= {max}_f64 {{")?;
+                    write_check_open(
+                        out,
+                        indent,
+                        &format!("{accessor} >= {max}_f64"),
+                        guard.as_deref(),
+                    )?;
                     write_error_push(
                         out,
                         indent,
@@ -440,7 +550,12 @@ fn write_field_checks(out: &mut String, field: &Field) -> std::fmt::Result {
                     )?;
                     writeln!(out, "{indent}}}")?;
                 } else {
-                    writeln!(out, "{indent}if {accessor} > {max}_f64 {{")?;
+                    write_check_open(
+                        out,
+                        indent,
+                        &format!("{accessor} > {max}_f64"),
+                        guard.as_deref(),
+                    )?;
                     write_error_push(
                         out,
                         indent,
@@ -451,7 +566,12 @@ fn write_field_checks(out: &mut String, field: &Field) -> std::fmt::Result {
                 }
             }
             if let Some(mult) = multiple_of {
-                writeln!(out, "{indent}if {accessor} % {mult}_f64 != 0.0 {{")?;
+                write_check_open(
+                    out,
+                    indent,
+                    &format!("{accessor} % {mult}_f64 != 0.0"),
+                    guard.as_deref(),
+                )?;
                 write_error_push(
                     out,
                     indent,
@@ -467,7 +587,12 @@ fn write_field_checks(out: &mut String, field: &Field) -> std::fmt::Result {
             unique_items,
         } => {
             if let Some(min) = min_items {
-                writeln!(out, "{indent}if {accessor}.len() < {min} {{")?;
+                write_check_open(
+                    out,
+                    indent,
+                    &format!("{accessor}.len() < {min}"),
+                    guard.as_deref(),
+                )?;
                 write_error_push(
                     out,
                     indent,
@@ -477,7 +602,12 @@ fn write_field_checks(out: &mut String, field: &Field) -> std::fmt::Result {
                 writeln!(out, "{indent}}}")?;
             }
             if let Some(max) = max_items {
-                writeln!(out, "{indent}if {accessor}.len() > {max} {{")?;
+                write_check_open(
+                    out,
+                    indent,
+                    &format!("{accessor}.len() > {max}"),
+                    guard.as_deref(),
+                )?;
                 write_error_push(
                     out,
                     indent,
@@ -505,7 +635,12 @@ fn write_field_checks(out: &mut String, field: &Field) -> std::fmt::Result {
             }
         }
         Constraints::Nested => {
-            writeln!(out, "{indent}if let Err(nested) = {accessor}.validate() {{")?;
+            write_check_open(
+                out,
+                indent,
+                &format!("let Err(nested) = {accessor}.validate()"),
+                guard.as_deref(),
+            )?;
             writeln!(
                 out,
                 "{indent}    errors.extend(nested.details.into_iter().map(|e| format!(\"{name}.{{e}}\")));"
@@ -528,7 +663,7 @@ fn write_field_checks(out: &mut String, field: &Field) -> std::fmt::Result {
         Constraints::None => {}
     }
 
-    if field.is_optional {
+    if field.is_optional && !collapsed {
         writeln!(out, "        }}")?;
     }
 
