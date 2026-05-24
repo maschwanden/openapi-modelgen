@@ -65,7 +65,7 @@ fn parse_schema(name: &str, schema: &Schema) -> Option<Entity> {
                     map_schema_to_type(field_schema)
                 }
             }
-            _ => resolve_field_type(field_ref),
+            ReferenceOr::Reference { .. } => resolve_field_type(field_ref),
         };
 
         let is_optional = !required || nullable;
@@ -112,7 +112,7 @@ fn parse_schema(name: &str, schema: &Schema) -> Option<Entity> {
 /// If the schema is a string with enum values, generate an EnumDef.
 fn try_extract_enum(field_name: &str, schema: &Schema) -> Option<EnumDef> {
     if let SchemaKind::Type(Type::String(s)) = &schema.schema_kind {
-        let values: Vec<String> = s.enumeration.iter().filter_map(|v| v.clone()).collect();
+        let values: Vec<String> = s.enumeration.iter().filter_map(Clone::clone).collect();
         if values.is_empty() {
             return None;
         }
@@ -155,9 +155,8 @@ fn parse_query(op: &Operation, components: Option<&openapiv3::Components>) -> Op
 
     for param in &query_params {
         let data = parameter_data(param);
-        let schema_ref = match &data.format {
-            openapiv3::ParameterSchemaOrContent::Schema(s) => s,
-            _ => continue,
+        let openapiv3::ParameterSchemaOrContent::Schema(schema_ref) = &data.format else {
+            continue;
         };
         let (rust_type, nullable) = resolve_schema_ref(schema_ref);
         let is_optional = !data.required || nullable;
@@ -187,7 +186,7 @@ fn parse_query(op: &Operation, components: Option<&openapiv3::Components>) -> Op
 fn extract_constraints(schema: &Schema) -> Constraints {
     match &schema.schema_kind {
         SchemaKind::Type(Type::String(s)) => {
-            let enumeration: Vec<String> = s.enumeration.iter().filter_map(|v| v.clone()).collect();
+            let enumeration: Vec<String> = s.enumeration.iter().filter_map(Clone::clone).collect();
             if s.min_length.is_none()
                 && s.max_length.is_none()
                 && s.pattern.is_none()

@@ -1,3 +1,5 @@
+#![allow(clippy::doc_markdown)]
+
 use std::{
     env, fs,
     path::{Path, PathBuf},

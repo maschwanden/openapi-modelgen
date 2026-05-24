@@ -260,14 +260,14 @@ fn write_error_push(out: &mut String, indent: &str, fmt_str: &str, args: &str) -
 /// Write the validation checks for a single field inside a `validate()` body.
 fn write_field_checks(out: &mut String, field: &Field) -> std::fmt::Result {
     let name = &field.name;
-    let ident = escape_keyword(name);
+    let field_ident = escape_keyword(name);
 
     // For optional fields, wrap in `if let Some`
     let (accessor, indent) = if field.is_optional {
-        writeln!(out, "        if let Some(val) = &self.{ident} {{")?;
+        writeln!(out, "        if let Some(val) = &self.{field_ident} {{")?;
         ("(*val)".to_string(), "            ")
     } else {
-        (format!("self.{ident}"), "        ")
+        (format!("self.{field_ident}"), "        ")
     };
 
     match &field.constraints {
@@ -496,7 +496,7 @@ fn write_field_checks(out: &mut String, field: &Field) -> std::fmt::Result {
                 writeln!(out, "{indent}        if !seen.insert(item) {{")?;
                 writeln!(
                     out,
-                    "{indent}            errors.push(format!(\"{name}: array contains duplicate items\"));"
+                    "{indent}            errors.push(\"{name}: array contains duplicate items\".to_string());"
                 )?;
                 writeln!(out, "{indent}            break;")?;
                 writeln!(out, "{indent}        }}")?;

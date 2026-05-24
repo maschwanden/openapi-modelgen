@@ -65,7 +65,7 @@ impl Validation for Greeting {
                 let mut seen = std::collections::HashSet::new();
                 for item in (*val).iter() {
                     if !seen.insert(item) {
-                        errors.push(format!("tags: array contains duplicate items"));
+                        errors.push("tags: array contains duplicate items".to_string());
                         break;
                     }
                 }
@@ -105,7 +105,7 @@ impl Validation for CreateGreetingRequest {
                 let mut seen = std::collections::HashSet::new();
                 for item in (*val).iter() {
                     if !seen.insert(item) {
-                        errors.push(format!("tags: array contains duplicate items"));
+                        errors.push("tags: array contains duplicate items".to_string());
                         break;
                     }
                 }
