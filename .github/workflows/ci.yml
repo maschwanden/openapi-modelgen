@@ -21,11 +21,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Format
-        run: cargo fmt -- --check
+      - uses: extractions/setup-just@v2
 
-      - name: Lint
-        run: cargo clippy -- -D warnings
-
-      - name: Test
-        run: cargo test
+      - name: CI
+        run: just ci
