@@ -3,20 +3,26 @@ use openapiv3::{
     VariantOrUnknownOrEmpty,
 };
 
-use crate::{Constraints, Entity, EntityKind, EnumDef, Field};
+use crate::{Constraints, Entity, EntityKind, EnumDef, Field, StructDef};
 
 /// Parse an OpenAPI spec into a list of entities.
 pub fn parse(spec: &OpenAPI) -> Vec<Entity> {
     let mut entities = Vec::new();
 
     if let Some(components) = &spec.components {
-        for (name, schema_ref) in &components.schemas {
-            if let ReferenceOr::Item(schema) = schema_ref
-                && let Some(entity) = parse_schema(name, schema)
-            {
-                entities.push(entity);
-            }
-        }
+        entities.extend(
+            components
+                .schemas
+                .iter()
+                .filter_map(|(name, ref_or)| match ref_or {
+                    ReferenceOr::Item(schema) => Some((name, schema)),
+                    _ => None,
+                })
+                .filter_map(|(name, schema)| {
+                    parse_schema(name, schema)
+                        .or_else(|| parse_enum(name, schema).map(Entity::Enum))
+                }),
+        );
     }
 
     for (_path, path_item_ref) in spec.paths.iter() {
@@ -56,7 +62,7 @@ fn parse_schema(name: &str, schema: &Schema) -> Option<Entity> {
         // Check for inline string enums
         let (rust_type, nullable) = match field_ref {
             ReferenceOr::Item(field_schema) => {
-                if let Some(enum_def) = try_extract_enum(field_name, field_schema) {
+                if let Some(enum_def) = parse_enum(field_name, field_schema) {
                     let ty = enum_def.name.clone();
                     let nullable = field_schema.schema_data.nullable;
                     enums.push(enum_def);
@@ -101,16 +107,16 @@ fn parse_schema(name: &str, schema: &Schema) -> Option<Entity> {
         });
     }
 
-    Some(Entity {
+    Some(Entity::Struct(StructDef {
         name: name.to_string(),
         kind: EntityKind::Schema,
         fields,
         enums,
-    })
+    }))
 }
 
 /// If the schema is a string with enum values, generate an EnumDef.
-fn try_extract_enum(field_name: &str, schema: &Schema) -> Option<EnumDef> {
+fn parse_enum(field_name: &str, schema: &Schema) -> Option<EnumDef> {
     if let SchemaKind::Type(Type::String(s)) = &schema.schema_kind {
         let values: Vec<String> = s.enumeration.iter().filter_map(Clone::clone).collect();
         if values.is_empty() {
@@ -174,12 +180,12 @@ fn parse_query(op: &Operation, components: Option<&openapiv3::Components>) -> Op
         });
     }
 
-    Some(Entity {
+    Some(Entity::Struct(StructDef {
         name: struct_name,
         kind: EntityKind::Query,
         fields,
         enums: Vec::new(),
-    })
+    }))
 }
 
 /// Extract validation constraints from an inline schema.
@@ -362,7 +368,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use super::*;
-    use crate::{Constraints, Entity, EntityKind, Field, load_spec};
+    use crate::{Constraints, Entity, EntityKind, Field, StructDef, load_spec};
 
     type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -390,6 +396,13 @@ info:
         Ok(load_spec(&full)?)
     }
 
+    fn first_struct_fields(entities: &[Entity]) -> &[Field] {
+        match &entities[0] {
+            Entity::Struct(s) => &s.fields,
+            _ => panic!("expected Entity::Struct"),
+        }
+    }
+
     #[test]
     fn parse_schema_entity() -> Result<()> {
         let yaml = format!(
@@ -412,7 +425,7 @@ components:
         assert_eq!(entities.len(), 1);
         assert_eq!(
             entities[0],
-            Entity {
+            Entity::Struct(StructDef {
                 name: String::from("Foo"),
                 kind: EntityKind::Schema,
                 fields: vec![
@@ -430,7 +443,36 @@ components:
                     },
                 ],
                 enums: vec![],
-            }
+            })
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn parse_standalone_enum() -> Result<()> {
+        let yaml = format!(
+            r"{MINIMAL_HEADER}
+paths: {{}}
+components:
+  schemas:
+    Status:
+      type: string
+      enum: [ACTIVE, INACTIVE, PENDING]
+"
+        );
+        let entities = parse(&load_spec(&yaml)?);
+        assert_eq!(entities.len(), 1);
+        assert_eq!(
+            entities[0],
+            Entity::Enum(EnumDef {
+                name: "Status".into(),
+                variants: vec![
+                    ("ACTIVE".into(), "ACTIVE".into()),
+                    ("INACTIVE".into(), "INACTIVE".into()),
+                    ("PENDING".into(), "PENDING".into()),
+                ],
+            })
         );
 
         Ok(())
@@ -466,11 +508,13 @@ components:
         );
         let entities = parse(&load_spec(&yaml)?);
         assert_eq!(entities.len(), 1);
-        let entity = &entities[0];
-        assert_eq!(entity.name, "GetThingsQuery");
-        assert_eq!(entity.kind, EntityKind::Query);
-        assert_eq!(entity.fields.len(), 1, "path param should be excluded");
-        assert_eq!(entity.fields[0].name, "limit");
+        let Entity::Struct(s) = &entities[0] else {
+            panic!("expected Entity::Struct");
+        };
+        assert_eq!(s.name, "GetThingsQuery");
+        assert_eq!(s.kind, EntityKind::Query);
+        assert_eq!(s.fields.len(), 1, "path param should be excluded");
+        assert_eq!(s.fields[0].name, "limit");
 
         Ok(())
     }
@@ -488,7 +532,7 @@ properties:
     pattern: '^[A-Z]{3}$'",
         )?;
         assert_eq!(
-            parse(&spec)[0].fields[0].constraints,
+            first_struct_fields(&parse(&spec))[0].constraints,
             Constraints::String {
                 min_length: None,
                 max_length: None,
@@ -510,7 +554,7 @@ properties:
     enum: [5, 10, 15]",
         )?;
         assert_eq!(
-            parse(&spec)[0].fields[0].constraints,
+            first_struct_fields(&parse(&spec))[0].constraints,
             Constraints::Integer {
                 minimum: None,
                 maximum: None,
@@ -535,7 +579,7 @@ properties:
     exclusiveMaximum: true",
         )?;
         assert_eq!(
-            parse(&spec)[0].fields[0].constraints,
+            first_struct_fields(&parse(&spec))[0].constraints,
             Constraints::Number {
                 minimum: Some(0.0),
                 maximum: Some(100.0),
@@ -558,7 +602,7 @@ properties:
     uniqueItems: true",
         )?;
         assert_eq!(
-            parse(&spec)[0].fields[0].constraints,
+            first_struct_fields(&parse(&spec))[0].constraints,
             Constraints::Array {
                 min_items: None,
                 max_items: None,
@@ -575,7 +619,10 @@ properties:
   name:
     type: string",
         )?;
-        assert_eq!(parse(&spec)[0].fields[0].constraints, Constraints::None);
+        assert_eq!(
+            first_struct_fields(&parse(&spec))[0].constraints,
+            Constraints::None
+        );
 
         // Type mapping: boolean → bool
         let spec = spec_with_schema(
@@ -586,7 +633,7 @@ properties:
   active:
     type: boolean",
         )?;
-        assert_eq!(parse(&spec)[0].fields[0].rust_type, "bool");
+        assert_eq!(first_struct_fields(&parse(&spec))[0].rust_type, "bool");
 
         // Type mapping: number → f64
         let spec = spec_with_schema(
@@ -597,7 +644,7 @@ properties:
   score:
     type: number",
         )?;
-        assert_eq!(parse(&spec)[0].fields[0].rust_type, "f64");
+        assert_eq!(first_struct_fields(&parse(&spec))[0].rust_type, "f64");
 
         Ok(())
     }

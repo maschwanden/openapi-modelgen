@@ -54,7 +54,15 @@ pub struct Field {
 }
 
 #[derive(Debug, PartialEq)]
-pub struct Entity {
+pub enum Entity {
+    /// A struct generated from an object schema or query parameters.
+    Struct(StructDef),
+    /// A standalone enum generated from a top-level string enum schema.
+    Enum(EnumDef),
+}
+
+#[derive(Debug, PartialEq)]
+pub struct StructDef {
     /// Struct name (e.g. `Foo`, `GetThingsQuery`).
     pub name: String,
     /// Whether this is a schema or query entity (affects derive macros).
@@ -468,6 +476,47 @@ mod validation;
 pub use model::*;
 pub use validation::{Validation, ValidationError};
 "
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn standalone_enum_schema() -> Result<()> {
+        let yaml = r##"
+openapi: "3.0.3"
+info:
+  title: Test
+  version: "0.1.0"
+paths: {}
+components:
+  schemas:
+    Status:
+      type: string
+      enum: [ACTIVE, INACTIVE]
+    Foo:
+      type: object
+      required: [status]
+      properties:
+        status:
+          $ref: "#/components/schemas/Status"
+"##;
+        let crate_ = generate(&load_spec(yaml)?, &test_config())?;
+
+        let model = file_content(&crate_, "src/model.rs");
+        assert!(
+            model.contains("pub enum Status {"),
+            "standalone enum should be generated: {model}"
+        );
+        assert!(
+            model.contains("pub status: Status,"),
+            "field should reference standalone enum: {model}"
+        );
+
+        let validation = file_content(&crate_, "src/validation.rs");
+        assert!(
+            validation.contains("impl Validation for Status {}"),
+            "standalone enum should get Validation impl: {validation}"
         );
 
         Ok(())

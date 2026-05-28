@@ -14,8 +14,13 @@ const RUST_KEYWORDS: &[&str] = &[
 
 /// Generate a complete crate from a list of parsed entities.
 pub fn write(entities: &[Entity], config: &Config) -> Result<GeneratedCrate, std::fmt::Error> {
-    let needs_regex = entities.iter().any(|e| {
-        e.fields.iter().any(|f| {
+    let struct_fields = entities.iter().filter_map(|e| match e {
+        Entity::Struct(s) => Some(s.fields.as_slice()),
+        Entity::Enum(_) => None,
+    });
+
+    let needs_regex = struct_fields.clone().any(|fields| {
+        fields.iter().any(|f| {
             matches!(
                 &f.constraints,
                 Constraints::String {
@@ -26,9 +31,9 @@ pub fn write(entities: &[Entity], config: &Config) -> Result<GeneratedCrate, std
         })
     });
 
-    let needs_uuid = entities
-        .iter()
-        .any(|e| e.fields.iter().any(|f| f.rust_type == "Uuid"));
+    let needs_uuid = struct_fields
+        .clone()
+        .any(|fields| fields.iter().any(|f| f.rust_type == "Uuid"));
 
     Ok(GeneratedCrate {
         files: vec![
@@ -56,10 +61,22 @@ fn header_comment() -> &'static str {
     "This file is @generated — do not edit manually."
 }
 
+fn write_enum(out: &mut String, name: &str, enum_def: &EnumDef) -> std::fmt::Result {
+    writeln!(out)?;
+    writeln!(out, "#[derive(Debug, Clone, Serialize, Deserialize)]")?;
+    writeln!(out, "pub enum {name} {{")?;
+    for (variant, original) in &enum_def.variants {
+        writeln!(out, "    #[serde(rename = \"{original}\")]")?;
+        writeln!(out, "    {variant},")?;
+    }
+    writeln!(out, "}}")
+}
+
 fn write_model_rs(entities: &[Entity]) -> Result<String, std::fmt::Error> {
-    let needs_uuid = entities
-        .iter()
-        .any(|e| e.fields.iter().any(|f| f.rust_type == "Uuid"));
+    let needs_uuid = entities.iter().any(|e| match e {
+        Entity::Struct(s) => s.fields.iter().any(|f| f.rust_type == "Uuid"),
+        Entity::Enum(_) => false,
+    });
 
     let uuid_import = if needs_uuid { "\nuse uuid::Uuid;" } else { "" };
 
@@ -74,23 +91,20 @@ fn write_model_rs(entities: &[Entity]) -> Result<String, std::fmt::Error> {
         std::collections::HashMap::new();
 
     for entity in entities {
-        for enum_def in &entity.enums {
-            let variants: Vec<String> = enum_def.variants.iter().map(|p| p.1.clone()).collect();
+        if let Entity::Struct(s) = entity {
+            for enum_def in &s.enums {
+                let variants: Vec<String> = enum_def.variants.iter().map(|p| p.1.clone()).collect();
 
-            if let Some(existing_name) = variants_to_name.get(&variants) {
-                // Reuse existing enum with same variants
-                enum_name_map.insert(
-                    (entity.name.clone(), enum_def.name.clone()),
-                    existing_name.clone(),
-                );
-            } else {
-                let prefixed = format!("{}{}", entity.name, enum_def.name);
-                enum_name_map.insert(
-                    (entity.name.clone(), enum_def.name.clone()),
-                    prefixed.clone(),
-                );
-                variants_to_name.insert(variants, prefixed.clone());
-                final_enums.push((prefixed, enum_def));
+                if let Some(existing_name) = variants_to_name.get(&variants) {
+                    // Reuse existing enum with same variants
+                    enum_name_map
+                        .insert((s.name.clone(), enum_def.name.clone()), existing_name.clone());
+                } else {
+                    let prefixed = format!("{}{}", s.name, enum_def.name);
+                    enum_name_map.insert((s.name.clone(), enum_def.name.clone()), prefixed.clone());
+                    variants_to_name.insert(variants, prefixed.clone());
+                    final_enums.push((prefixed, enum_def));
+                }
             }
         }
     }
@@ -105,21 +119,22 @@ use serde::{{Deserialize, Serialize}};{uuid_import}
 "
     );
 
-    // Emit enums
-    for (enum_name, enum_def) in &final_enums {
-        writeln!(out)?;
-        writeln!(out, "#[derive(Debug, Clone, Serialize, Deserialize)]")?;
-        writeln!(out, "pub enum {enum_name} {{")?;
-        for (variant, original) in &enum_def.variants {
-            writeln!(out, "    #[serde(rename = \"{original}\")]")?;
-            writeln!(out, "    {variant},")?;
+    // Emit enums (standalone + inline)
+    for entity in entities {
+        if let Entity::Enum(enum_def) = entity {
+            write_enum(&mut out, &enum_def.name, enum_def)?;
         }
-        writeln!(out, "}}")?;
+    }
+    for (enum_name, enum_def) in &final_enums {
+        write_enum(&mut out, enum_name, enum_def)?;
     }
 
     for entity in entities {
+        let Entity::Struct(s) = entity else {
+            continue;
+        };
         writeln!(out)?;
-        match entity.kind {
+        match s.kind {
             EntityKind::Schema => {
                 writeln!(out, "#[derive(Debug, Clone, Serialize, Deserialize)]")?;
             }
@@ -127,11 +142,11 @@ use serde::{{Deserialize, Serialize}};{uuid_import}
                 writeln!(out, "#[derive(Debug, Clone, Deserialize)]")?;
             }
         }
-        writeln!(out, "pub struct {} {{", entity.name)?;
-        for field in &entity.fields {
+        writeln!(out, "pub struct {} {{", s.name)?;
+        for field in &s.fields {
             // Resolve enum type name if this field uses a renamed enum
             let resolved_type = enum_name_map
-                .get(&(entity.name.clone(), field.rust_type.clone()))
+                .get(&(s.name.clone(), field.rust_type.clone()))
                 .cloned()
                 .unwrap_or_else(|| field.rust_type.clone());
             let final_type = if field.is_optional {
@@ -204,24 +219,30 @@ impl<T: Validation> Validation for Vec<T> {{
     );
 
     for entity in entities {
-        write_validation_impl(&mut out, entity)?;
+        match entity {
+            Entity::Struct(s) => write_validation_impl(&mut out, &s.name, &s.fields)?,
+            Entity::Enum(e) => {
+                writeln!(out)?;
+                writeln!(out, "impl Validation for {} {{}}", e.name)?;
+            }
+        }
     }
 
     Ok(out)
 }
 
-/// Write the `impl Validation` block for an entity.
-fn write_validation_impl(out: &mut String, entity: &Entity) -> std::fmt::Result {
-    let has_any_checks = entity.fields.iter().any(|f| f.constraints.has_checks());
+/// Write the `impl Validation` block for a struct entity.
+fn write_validation_impl(out: &mut String, name: &str, fields: &[Field]) -> std::fmt::Result {
+    let has_any_checks = fields.iter().any(|f| f.constraints.has_checks());
 
     writeln!(out)?;
 
     if !has_any_checks {
-        writeln!(out, "impl Validation for {} {{}}", entity.name)?;
+        writeln!(out, "impl Validation for {name} {{}}")?;
         return Ok(());
     }
 
-    writeln!(out, "impl Validation for {} {{", entity.name)?;
+    writeln!(out, "impl Validation for {name} {{")?;
 
     writeln!(
         out,
@@ -229,7 +250,7 @@ fn write_validation_impl(out: &mut String, entity: &Entity) -> std::fmt::Result 
     )?;
     writeln!(out, "        let mut errors = Vec::new();")?;
 
-    for field in &entity.fields {
+    for field in fields {
         if !field.constraints.has_checks() {
             continue;
         }
@@ -758,7 +779,7 @@ fn escape_keyword(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Config, Constraints, EntityKind, Field};
+    use crate::{Config, Constraints, EntityKind, Field, StructDef};
 
     type Result = std::result::Result<(), Box<dyn std::error::Error>>;
 
@@ -779,12 +800,12 @@ mod tests {
     }
 
     fn single_field_entity(name: &str, kind: EntityKind, field: Field) -> Entity {
-        Entity {
+        Entity::Struct(StructDef {
             name: name.into(),
             kind,
             fields: vec![field],
             enums: vec![],
-        }
+        })
     }
 
     fn required_field(name: &str, rust_type: &str, constraints: Constraints) -> Field {
