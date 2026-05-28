@@ -25,22 +25,24 @@ pub fn parse(spec: &OpenAPI) -> Vec<Entity> {
         );
     }
 
-    for (_path, path_item_ref) in spec.paths.iter() {
+    for (path, path_item_ref) in spec.paths.iter() {
         let path_item = match path_item_ref {
             ReferenceOr::Item(item) => item,
             ReferenceOr::Reference { .. } => continue,
         };
 
-        let ops = [
-            &path_item.get,
-            &path_item.put,
-            &path_item.post,
-            &path_item.patch,
-            &path_item.delete,
+        let ops: [(&str, &Option<Operation>); 5] = [
+            ("get", &path_item.get),
+            ("put", &path_item.put),
+            ("post", &path_item.post),
+            ("patch", &path_item.patch),
+            ("delete", &path_item.delete),
         ];
-        for op in ops.into_iter().flatten() {
-            if let Some(entity) = parse_query(op, spec.components.as_ref()) {
-                entities.push(entity);
+        for (method, op) in ops {
+            if let Some(op) = op {
+                if let Some(entity) = parse_query(op, spec.components.as_ref(), method, path) {
+                    entities.push(entity);
+                }
             }
         }
     }
@@ -139,7 +141,12 @@ fn parse_enum(field_name: &str, schema: &Schema) -> Option<EnumDef> {
     }
 }
 
-fn parse_query(op: &Operation, components: Option<&openapiv3::Components>) -> Option<Entity> {
+fn parse_query(
+    op: &Operation,
+    components: Option<&openapiv3::Components>,
+    method: &str,
+    path: &str,
+) -> Option<Entity> {
     let query_params: Vec<_> = op
         .parameters
         .iter()
@@ -154,8 +161,10 @@ fn parse_query(op: &Operation, components: Option<&openapiv3::Components>) -> Op
         return None;
     }
 
-    let operation_id = op.operation_id.as_ref()?;
-    let struct_name = format!("{}Query", to_pascal_case(operation_id));
+    let struct_name = match &op.operation_id {
+        Some(id) => format!("{}Query", to_pascal_case(id)),
+        None => format!("{}Query", query_name_from_path(method, path)),
+    };
 
     let mut fields = Vec::new();
 
@@ -345,6 +354,21 @@ fn map_schema_to_type(schema: &Schema) -> (String, bool) {
     }
 }
 
+/// Derive a PascalCase name from an HTTP method and path.
+///
+/// E.g. `("get", "/api/value-raw/{id}/timeseries")` → `"GetValueRawTimeseries"`.
+/// Path parameters like `{id}` are stripped.
+fn query_name_from_path(method: &str, path: &str) -> String {
+    let segments = path
+        .split('/')
+        .filter(|s| !s.is_empty() && !s.starts_with('{'));
+    let mut name = to_pascal_case(method);
+    for segment in segments {
+        name.push_str(&to_pascal_case(segment));
+    }
+    name
+}
+
 /// Convert a `snake_case` or `kebab-case` string to `PascalCase`.
 pub(crate) fn to_pascal_case(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
@@ -515,6 +539,40 @@ components:
         assert_eq!(s.kind, EntityKind::Query);
         assert_eq!(s.fields.len(), 1, "path param should be excluded");
         assert_eq!(s.fields[0].name, "limit");
+
+        Ok(())
+    }
+
+    #[test]
+    fn parse_query_without_operation_id() -> Result<()> {
+        let yaml = format!(
+            r#"{MINIMAL_HEADER}
+paths:
+  /api/value-raw/{{id}}/timeseries:
+    get:
+      parameters:
+        - name: from
+          in: query
+          required: true
+          schema:
+            type: string
+            format: date-time
+      responses:
+        "200":
+          description: OK
+components:
+  schemas: {{}}
+"#
+        );
+        let entities = parse(&load_spec(&yaml)?);
+        assert_eq!(entities.len(), 1);
+        let Entity::Struct(s) = &entities[0] else {
+            panic!("expected Entity::Struct");
+        };
+        assert_eq!(s.name, "GetApiValueRawTimeseriesQuery");
+        assert_eq!(s.kind, EntityKind::Query);
+        assert_eq!(s.fields.len(), 1);
+        assert_eq!(s.fields[0].name, "from");
 
         Ok(())
     }
