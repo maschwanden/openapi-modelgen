@@ -110,11 +110,22 @@ fn write_enum(out: &mut String, name: &str, enum_def: &EnumDef) -> std::fmt::Res
 }
 
 fn write_model_rs(entities: &[Entity]) -> Result<String, std::fmt::Error> {
-    let needs_uuid = entities.iter().any(|e| match e {
-        Entity::Struct(s) => s.fields.iter().any(|f| f.rust_type == "Uuid"),
-        Entity::Enum(_) => false,
+    let struct_fields = entities.iter().filter_map(|e| match e {
+        Entity::Struct(s) => Some(&s.fields),
+        Entity::Enum(_) => None,
     });
+    let has_type = |ty: &str| struct_fields.clone().any(|fields| fields.iter().any(|f| f.rust_type.contains(ty)));
 
+    let needs_datetime = has_type("DateTime");
+    let needs_naive_date = has_type("NaiveDate");
+    let needs_uuid = has_type("Uuid");
+
+    let chrono_import = match (needs_datetime, needs_naive_date) {
+        (true, true) => "\nuse chrono::{DateTime, NaiveDate, Utc};",
+        (true, false) => "\nuse chrono::{DateTime, Utc};",
+        (false, true) => "\nuse chrono::NaiveDate;",
+        (false, false) => "",
+    };
     let uuid_import = if needs_uuid { "\nuse uuid::Uuid;" } else { "" };
 
     let (enum_name_map, final_enums) = resolve_inline_enums(entities);
@@ -123,8 +134,7 @@ fn write_model_rs(entities: &[Entity]) -> Result<String, std::fmt::Error> {
     let mut out = format!(
         "\
 // {header}
-
-use chrono::{{DateTime, NaiveDate, Utc}};
+{chrono_import}
 use serde::{{Deserialize, Serialize}};{uuid_import}
 "
     );

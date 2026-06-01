@@ -293,7 +293,6 @@ components:
             "\
 // This file is @generated — do not edit manually.
 
-use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -360,7 +359,6 @@ components:
             "\
 // This file is @generated — do not edit manually.
 
-use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Deserialize)]
