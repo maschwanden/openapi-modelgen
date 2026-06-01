@@ -61,6 +61,43 @@ fn header_comment() -> &'static str {
     "This file is @generated — do not edit manually."
 }
 
+/// Collect deduplicated inline enum names from struct entities.
+///
+/// Returns a map from `(entity_name, raw_enum_name)` → resolved prefixed name,
+/// plus a vec of `(resolved_name, &EnumDef)` for the unique enums to emit.
+fn resolve_inline_enums<'a>(
+    entities: &'a [Entity],
+) -> (
+    std::collections::HashMap<(String, String), String>,
+    Vec<(String, &'a EnumDef)>,
+) {
+    let mut enum_name_map: std::collections::HashMap<(String, String), String> =
+        std::collections::HashMap::new();
+    let mut final_enums: Vec<(String, &EnumDef)> = Vec::new();
+    let mut variants_to_name: std::collections::HashMap<Vec<String>, String> =
+        std::collections::HashMap::new();
+
+    for entity in entities {
+        if let Entity::Struct(s) = entity {
+            for enum_def in &s.enums {
+                let variants: Vec<String> = enum_def.variants.iter().map(|p| p.1.clone()).collect();
+
+                if let Some(existing_name) = variants_to_name.get(&variants) {
+                    enum_name_map
+                        .insert((s.name.clone(), enum_def.name.clone()), existing_name.clone());
+                } else {
+                    let prefixed = format!("{}{}", s.name, enum_def.name);
+                    enum_name_map.insert((s.name.clone(), enum_def.name.clone()), prefixed.clone());
+                    variants_to_name.insert(variants, prefixed.clone());
+                    final_enums.push((prefixed, enum_def));
+                }
+            }
+        }
+    }
+
+    (enum_name_map, final_enums)
+}
+
 fn write_enum(out: &mut String, name: &str, enum_def: &EnumDef) -> std::fmt::Result {
     writeln!(out)?;
     writeln!(out, "#[derive(Debug, Clone, Serialize, Deserialize)]")?;
@@ -80,34 +117,7 @@ fn write_model_rs(entities: &[Entity]) -> Result<String, std::fmt::Error> {
 
     let uuid_import = if needs_uuid { "\nuse uuid::Uuid;" } else { "" };
 
-    // -- Resolve enum names.
-    // Always prefix inline enums with their parent entity name (e.g. `LoginSuccessResponseStatus`).
-    // Deduplicate: if two prefixed enums have identical variants, reuse the first one.
-    let mut enum_name_map: std::collections::HashMap<(String, String), String> =
-        std::collections::HashMap::new();
-    let mut final_enums: Vec<(String, &EnumDef)> = Vec::new();
-    // variants → first emitted enum name (for deduplication across entities)
-    let mut variants_to_name: std::collections::HashMap<Vec<String>, String> =
-        std::collections::HashMap::new();
-
-    for entity in entities {
-        if let Entity::Struct(s) = entity {
-            for enum_def in &s.enums {
-                let variants: Vec<String> = enum_def.variants.iter().map(|p| p.1.clone()).collect();
-
-                if let Some(existing_name) = variants_to_name.get(&variants) {
-                    // Reuse existing enum with same variants
-                    enum_name_map
-                        .insert((s.name.clone(), enum_def.name.clone()), existing_name.clone());
-                } else {
-                    let prefixed = format!("{}{}", s.name, enum_def.name);
-                    enum_name_map.insert((s.name.clone(), enum_def.name.clone()), prefixed.clone());
-                    variants_to_name.insert(variants, prefixed.clone());
-                    final_enums.push((prefixed, enum_def));
-                }
-            }
-        }
-    }
+    let (enum_name_map, final_enums) = resolve_inline_enums(entities);
 
     let header = header_comment();
     let mut out = format!(
@@ -218,6 +228,8 @@ impl<T: Validation> Validation for Vec<T> {{
 "
     );
 
+    let (_, inline_enums) = resolve_inline_enums(entities);
+
     for entity in entities {
         match entity {
             Entity::Struct(s) => write_validation_impl(&mut out, &s.name, &s.fields)?,
@@ -226,6 +238,11 @@ impl<T: Validation> Validation for Vec<T> {{
                 writeln!(out, "impl Validation for {} {{}}", e.name)?;
             }
         }
+    }
+
+    for (enum_name, _) in &inline_enums {
+        writeln!(out)?;
+        writeln!(out, "impl Validation for {enum_name} {{}}")?;
     }
 
     Ok(out)
