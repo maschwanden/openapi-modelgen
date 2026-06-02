@@ -122,19 +122,17 @@ impl Validation for CreateGreetingRequest {
 impl Validation for ListGreetingsQuery {
     fn validate(&self) -> Result<(), ValidationError> {
         let mut errors = Vec::new();
-        if let Some(val) = &self.limit {
-            if (*val) < 1 {
-                errors.push(format!(
-                    "limit: value {} is less than minimum 1",
-                    (*val)
-                ));
-            }
-            if (*val) > 100 {
-                errors.push(format!(
-                    "limit: value {} exceeds maximum 100",
-                    (*val)
-                ));
-            }
+        if self.limit < 1 {
+            errors.push(format!(
+                "limit: value {} is less than minimum 1",
+                self.limit
+            ));
+        }
+        if self.limit > 100 {
+            errors.push(format!(
+                "limit: value {} exceeds maximum 100",
+                self.limit
+            ));
         }
         if errors.is_empty() {
             Ok(())
@@ -143,3 +141,5 @@ impl Validation for ListGreetingsQuery {
         }
     }
 }
+
+impl Validation for GreetingLanguage {}

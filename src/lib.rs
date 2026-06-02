@@ -51,6 +51,8 @@ pub struct Field {
     pub is_optional: bool,
     /// Validation constraints extracted from the OpenAPI schema.
     pub constraints: Constraints,
+    /// Default value from the OpenAPI schema, if present and supported.
+    pub default_value: Option<serde_json::Value>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -515,6 +517,364 @@ components:
         assert!(
             validation.contains("impl Validation for Status {}"),
             "standalone enum should get Validation impl: {validation}"
+        );
+
+        Ok(())
+    }
+
+    /// Scalar defaults (String, i32, f64, bool): non-nullable, non-required fields
+    /// with defaults should be promoted from Option<T> to T. A default.rs file
+    /// should be generated with the default-value functions.
+    #[test]
+    fn scalar_defaults() -> Result<()> {
+        let yaml = r#"
+openapi: "3.0.3"
+info:
+  title: Test
+  version: "0.1.0"
+paths: {}
+components:
+  schemas:
+    Config:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+          default: "default_name"
+        count:
+          type: integer
+          format: int32
+          default: 42
+        rate:
+          type: number
+          default: 1.5
+        enabled:
+          type: boolean
+          default: true
+"#;
+        let crate_ = generate(&load_spec(yaml)?, &test_config())?;
+
+        assert_eq!(
+            file_content(&crate_, "src/model.rs"),
+            "\
+// This file is @generated — do not edit manually.
+
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Config {
+    #[serde(default = \"crate::default::config_name\")]
+    pub name: String,
+    #[serde(default = \"crate::default::config_count\")]
+    pub count: i32,
+    #[serde(default = \"crate::default::config_rate\")]
+    pub rate: f64,
+    #[serde(default = \"crate::default::config_enabled\")]
+    pub enabled: bool,
+}
+"
+        );
+
+        assert_eq!(
+            file_content(&crate_, "src/default.rs"),
+            "\
+// This file is @generated — do not edit manually.
+
+\npub(crate) fn config_name() -> String {
+    String::from(\"default_name\")
+}
+
+pub(crate) fn config_count() -> i32 {
+    42
+}
+
+pub(crate) fn config_rate() -> f64 {
+    1.5_f64
+}
+
+pub(crate) fn config_enabled() -> bool {
+    true
+}
+"
+        );
+
+        assert_eq!(
+            file_content(&crate_, "src/lib.rs"),
+            "\
+// This file is @generated — do not edit manually.
+
+mod default;
+mod model;
+mod validation;
+
+pub use model::*;
+pub use validation::{Validation, ValidationError};
+"
+        );
+
+        Ok(())
+    }
+
+    /// Nullable + default: field stays Option<T>, default fn returns Some(value).
+    #[test]
+    fn nullable_with_default() -> Result<()> {
+        let yaml = r#"
+openapi: "3.0.3"
+info:
+  title: Test
+  version: "0.1.0"
+paths: {}
+components:
+  schemas:
+    Foo:
+      type: object
+      properties:
+        label:
+          type: string
+          nullable: true
+          default: "unknown"
+"#;
+        let crate_ = generate(&load_spec(yaml)?, &test_config())?;
+        let model = file_content(&crate_, "src/model.rs");
+        assert!(
+            model.contains("pub label: Option<String>,"),
+            "nullable field should stay Option: {model}"
+        );
+
+        let defaults = file_content(&crate_, "src/default.rs");
+        assert!(
+            defaults.contains("pub(crate) fn foo_label() -> Option<String>"),
+            "return type should be Option: {defaults}"
+        );
+        assert!(
+            defaults.contains(r#"Some(String::from("unknown"))"#),
+            "should wrap in Some: {defaults}"
+        );
+
+        Ok(())
+    }
+
+    /// DateTime, NaiveDate, Uuid defaults use .parse()/.parse_str() with .expect().
+    #[test]
+    fn parsed_type_defaults() -> Result<()> {
+        let yaml = r#"
+openapi: "3.0.3"
+info:
+  title: Test
+  version: "0.1.0"
+paths: {}
+components:
+  schemas:
+    Event:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+          default: "2024-01-01T00:00:00Z"
+        event_date:
+          type: string
+          format: date
+          default: "2024-06-15"
+        event_id:
+          type: string
+          format: uuid
+          default: "550e8400-e29b-41d4-a716-446655440000"
+"#;
+        let crate_ = generate(&load_spec(yaml)?, &test_config())?;
+
+        assert_eq!(
+            file_content(&crate_, "src/default.rs"),
+            "\
+// This file is @generated — do not edit manually.
+
+use chrono::{DateTime, NaiveDate, Utc};
+use uuid::Uuid;
+
+pub(crate) fn event_created_at() -> DateTime<Utc> {
+    \"2024-01-01T00:00:00Z\".parse::<DateTime<Utc>>().expect(\"hardcoded default from OpenAPI spec\")
+}
+
+pub(crate) fn event_event_date() -> NaiveDate {
+    \"2024-06-15\".parse::<NaiveDate>().expect(\"hardcoded default from OpenAPI spec\")
+}
+
+pub(crate) fn event_event_id() -> Uuid {
+    Uuid::parse_str(\"550e8400-e29b-41d4-a716-446655440000\").expect(\"hardcoded default from OpenAPI spec\")
+}
+"
+        );
+
+        Ok(())
+    }
+
+    /// Inline enum defaults: the default string is mapped to the variant name.
+    #[test]
+    fn inline_enum_default() -> Result<()> {
+        let yaml = r##"
+openapi: "3.0.3"
+info:
+  title: Test
+  version: "0.1.0"
+paths: {}
+components:
+  schemas:
+    Greeting:
+      type: object
+      required: [message]
+      properties:
+        message:
+          type: string
+        language:
+          type: string
+          enum: [en, de, fr]
+          default: en
+"##;
+        let crate_ = generate(&load_spec(yaml)?, &test_config())?;
+        let defaults = file_content(&crate_, "src/default.rs");
+
+        assert!(
+            defaults.contains("pub(crate) fn greeting_language() -> GreetingLanguage"),
+            "missing enum default fn: {defaults}"
+        );
+        assert!(
+            defaults.contains("GreetingLanguage::En"),
+            "missing enum variant in default: {defaults}"
+        );
+
+        let model = file_content(&crate_, "src/model.rs");
+        assert!(
+            model.contains("pub language: GreetingLanguage,"),
+            "enum field with default should be promoted to bare type: {model}"
+        );
+
+        Ok(())
+    }
+
+    /// Unsupported default types (Vec) should be silently ignored.
+    #[test]
+    fn unsupported_default_ignored() -> Result<()> {
+        let yaml = r#"
+openapi: "3.0.3"
+info:
+  title: Test
+  version: "0.1.0"
+paths: {}
+components:
+  schemas:
+    Foo:
+      type: object
+      properties:
+        tags:
+          type: array
+          items:
+            type: string
+          default: ["a", "b"]
+"#;
+        let crate_ = generate(&load_spec(yaml)?, &test_config())?;
+        let model = file_content(&crate_, "src/model.rs");
+
+        // Vec default is unsupported → field stays Option<Vec<String>>
+        assert!(
+            model.contains("pub tags: Option<Vec<String>>,"),
+            "unsupported default should leave field as Option: {model}"
+        );
+
+        // No default.rs should be generated (no supported defaults)
+        assert!(
+            crate_.files.iter().all(|f| f.path != "src/default.rs"),
+            "default.rs should not be generated when no supported defaults exist"
+        );
+
+        // lib.rs should NOT include mod default
+        let lib = file_content(&crate_, "src/lib.rs");
+        assert!(
+            !lib.contains("mod default;"),
+            "lib.rs should not include default module: {lib}"
+        );
+
+        Ok(())
+    }
+
+    /// Query parameters with defaults should also be promoted.
+    #[test]
+    fn query_param_with_default() -> Result<()> {
+        let yaml = r#"
+openapi: "3.0.3"
+info:
+  title: Test
+  version: "0.1.0"
+paths:
+  /things:
+    get:
+      operationId: getThings
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            format: int32
+            default: 20
+      responses:
+        "200":
+          description: OK
+components:
+  schemas: {}
+"#;
+        let crate_ = generate(&load_spec(yaml)?, &test_config())?;
+        let model = file_content(&crate_, "src/model.rs");
+
+        // limit has default → promoted from Option<i32> to i32
+        assert!(
+            model.contains("pub limit: i32,"),
+            "query param with default should be promoted: {model}"
+        );
+        assert!(
+            model.contains(r#"#[serde(default = "crate::default::get_things_query_limit")]"#),
+            "missing serde default attr: {model}"
+        );
+
+        let defaults = file_content(&crate_, "src/default.rs");
+        assert!(
+            defaults.contains("pub(crate) fn get_things_query_limit() -> i32"),
+            "missing default fn for query param: {defaults}"
+        );
+
+        Ok(())
+    }
+
+    /// No defaults in spec → no default.rs generated, lib.rs unchanged.
+    #[test]
+    fn no_defaults_no_default_file() -> Result<()> {
+        let yaml = r#"
+openapi: "3.0.3"
+info:
+  title: Test
+  version: "0.1.0"
+paths: {}
+components:
+  schemas:
+    Simple:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+"#;
+        let crate_ = generate(&load_spec(yaml)?, &test_config())?;
+        assert!(
+            crate_.files.iter().all(|f| f.path != "src/default.rs"),
+            "default.rs should not exist without defaults"
+        );
+        let lib = file_content(&crate_, "src/lib.rs");
+        assert!(
+            !lib.contains("mod default;"),
+            "no default module when no defaults: {lib}"
         );
 
         Ok(())

@@ -39,10 +39,10 @@ pub fn parse(spec: &OpenAPI) -> Vec<Entity> {
             ("delete", &path_item.delete),
         ];
         for (method, op) in ops {
-            if let Some(op) = op {
-                if let Some(entity) = parse_query(op, spec.components.as_ref(), method, path) {
-                    entities.push(entity);
-                }
+            if let Some(op) = op
+                && let Some(entity) = parse_query(op, spec.components.as_ref(), method, path)
+            {
+                entities.push(entity);
             }
         }
     }
@@ -76,12 +76,28 @@ fn parse_schema(name: &str, schema: &Schema) -> Option<Entity> {
             ReferenceOr::Reference { .. } => resolve_field_type(field_ref),
         };
 
-        let is_optional = !required || nullable;
+        // Extract default value (only for supported types).
+        let is_enum_field = enums.iter().any(|e| e.name == rust_type);
+        let default_value = match field_ref {
+            ReferenceOr::Item(field_schema) => extract_default(
+                &field_schema.schema_data.default,
+                &rust_type,
+                is_enum_field,
+                name,
+                field_name,
+            ),
+            ReferenceOr::Reference { .. } => None,
+        };
+
+        let has_default = default_value.is_some();
+        let is_optional = if has_default {
+            nullable
+        } else {
+            !required || nullable
+        };
 
         // If the field was converted to an enum type, serde handles validation —
         // no runtime constraints needed.
-        let is_enum_field = enums.iter().any(|e| e.name == rust_type);
-
         let constraints = if is_enum_field {
             Constraints::None
         } else {
@@ -106,6 +122,7 @@ fn parse_schema(name: &str, schema: &Schema) -> Option<Entity> {
             rust_type,
             is_optional,
             constraints,
+            default_value,
         });
     }
 
@@ -174,7 +191,24 @@ fn parse_query(
             continue;
         };
         let (rust_type, nullable) = resolve_schema_ref(schema_ref);
-        let is_optional = !data.required || nullable;
+
+        let default_value = match schema_ref {
+            ReferenceOr::Item(schema) => extract_default(
+                &schema.schema_data.default,
+                &rust_type,
+                false,
+                &struct_name,
+                &data.name,
+            ),
+            ReferenceOr::Reference { .. } => None,
+        };
+
+        let has_default = default_value.is_some();
+        let is_optional = if has_default {
+            nullable
+        } else {
+            !data.required || nullable
+        };
 
         let constraints = match schema_ref {
             ReferenceOr::Reference { .. } => Constraints::Nested,
@@ -186,6 +220,7 @@ fn parse_query(
             rust_type,
             is_optional,
             constraints,
+            default_value,
         });
     }
 
@@ -354,6 +389,53 @@ fn map_schema_to_type(schema: &Schema) -> (String, bool) {
     }
 }
 
+/// Check whether a JSON default value can be represented as a Rust literal
+/// for the given type. Inline enum fields pass `is_enum = true`.
+fn is_supported_default(value: &serde_json::Value, rust_type: &str, is_enum: bool) -> bool {
+    match value {
+        serde_json::Value::String(_) => {
+            matches!(rust_type, "String" | "DateTime<Utc>" | "NaiveDate" | "Uuid") || is_enum
+        }
+        serde_json::Value::Number(_) => matches!(rust_type, "i32" | "i64" | "f64"),
+        serde_json::Value::Bool(_) => rust_type == "bool",
+        _ => false,
+    }
+}
+
+/// Extract and validate a default value. Returns `Some` if the default is
+/// supported, `None` otherwise. Logs a warning when a default is present
+/// in the spec but cannot be represented in the generated code.
+fn extract_default(
+    raw: &Option<serde_json::Value>,
+    rust_type: &str,
+    is_enum: bool,
+    schema_name: &str,
+    field_name: &str,
+) -> Option<serde_json::Value> {
+    let value = raw.as_ref()?;
+    if is_supported_default(value, rust_type, is_enum) {
+        Some(value.clone())
+    } else {
+        log::warn!(
+            "{schema_name}.{field_name}: default value {value} \
+             ignored (type `{rust_type}` does not support code-generated defaults)"
+        );
+        None
+    }
+}
+
+/// Convert a `PascalCase` string to `snake_case`.
+pub(crate) fn to_snake_case(s: &str) -> String {
+    let mut result = String::with_capacity(s.len() + 4);
+    for (i, c) in s.chars().enumerate() {
+        if c.is_uppercase() && i > 0 {
+            result.push('_');
+        }
+        result.extend(c.to_lowercase());
+    }
+    result
+}
+
 /// Derive a PascalCase name from an HTTP method and path.
 ///
 /// E.g. `("get", "/api/value-raw/{id}/timeseries")` → `"GetValueRawTimeseries"`.
@@ -458,12 +540,14 @@ components:
                         rust_type: "i64".into(),
                         is_optional: false,
                         constraints: Constraints::None,
+                        default_value: None,
                     },
                     Field {
                         name: "name".into(),
                         rust_type: "String".into(),
                         is_optional: true,
                         constraints: Constraints::None,
+                        default_value: None,
                     },
                 ],
                 enums: vec![],

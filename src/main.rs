@@ -33,6 +33,10 @@ struct Args {
 }
 
 fn main() {
+    env_logger::Builder::from_default_env()
+        .filter_level(log::LevelFilter::Warn)
+        .init();
+
     let args = Args::parse();
     let input = expand_tilde(&args.input);
     let output_dir = expand_tilde(&args.output_dir);

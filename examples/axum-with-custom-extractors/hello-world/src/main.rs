@@ -33,16 +33,11 @@ async fn main() {
 async fn list_greetings(
     QueryV(params): QueryV<ListGreetingsQuery>,
 ) -> Result<Json<Vec<Greeting>>, AppError> {
-    let limit = params.limit.unwrap_or(100) as usize;
+    let limit = params.limit as usize;
 
     let greetings: Vec<Greeting> = seed_greetings()
         .into_iter()
-        .filter(|g| {
-            params
-                .language
-                .as_ref()
-                .is_none_or(|lang| lang == &format!("{:?}", g.language).to_lowercase())
-        })
+        .filter(|g| params.language == format!("{:?}", g.language).to_lowercase())
         .take(limit)
         .collect();
 

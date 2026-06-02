@@ -2,6 +2,7 @@ use std::fmt::Write;
 
 use crate::{
     Config, Constraints, Entity, EntityKind, EnumDef, Field, GeneratedCrate, GeneratedFile,
+    parse::to_snake_case,
 };
 
 /// Rust strict keywords that must be escaped with `r#` when used as identifiers.
@@ -35,26 +36,39 @@ pub fn write(entities: &[Entity], config: &Config) -> Result<GeneratedCrate, std
         .clone()
         .any(|fields| fields.iter().any(|f| f.rust_type == "Uuid"));
 
-    Ok(GeneratedCrate {
-        files: vec![
-            GeneratedFile {
-                path: "Cargo.toml",
-                content: generate_cargo_toml(config, needs_regex, needs_uuid),
-            },
-            GeneratedFile {
-                path: "src/lib.rs",
-                content: generate_lib_rs(),
-            },
-            GeneratedFile {
-                path: "src/validation.rs",
-                content: write_validation_rs(entities, needs_regex)?,
-            },
-            GeneratedFile {
-                path: "src/model.rs",
-                content: write_model_rs(entities)?,
-            },
-        ],
-    })
+    let needs_defaults = struct_fields
+        .clone()
+        .any(|fields| fields.iter().any(|f| f.default_value.is_some()));
+
+    let (enum_name_map, _) = resolve_inline_enums(entities);
+
+    let mut files = vec![
+        GeneratedFile {
+            path: "Cargo.toml",
+            content: generate_cargo_toml(config, needs_regex, needs_uuid),
+        },
+        GeneratedFile {
+            path: "src/lib.rs",
+            content: generate_lib_rs(needs_defaults),
+        },
+        GeneratedFile {
+            path: "src/validation.rs",
+            content: write_validation_rs(entities, needs_regex)?,
+        },
+        GeneratedFile {
+            path: "src/model.rs",
+            content: write_model_rs(entities, &enum_name_map)?,
+        },
+    ];
+
+    if needs_defaults {
+        files.push(GeneratedFile {
+            path: "src/default.rs",
+            content: write_default_rs(entities, &enum_name_map)?,
+        });
+    }
+
+    Ok(GeneratedCrate { files })
 }
 
 fn header_comment() -> &'static str {
@@ -65,14 +79,10 @@ fn header_comment() -> &'static str {
 ///
 /// Returns a map from `(entity_name, raw_enum_name)` → resolved prefixed name,
 /// plus a vec of `(resolved_name, &EnumDef)` for the unique enums to emit.
-fn resolve_inline_enums<'a>(
-    entities: &'a [Entity],
-) -> (
-    std::collections::HashMap<(String, String), String>,
-    Vec<(String, &'a EnumDef)>,
-) {
-    let mut enum_name_map: std::collections::HashMap<(String, String), String> =
-        std::collections::HashMap::new();
+type EnumNameMap = std::collections::HashMap<(String, String), String>;
+
+fn resolve_inline_enums(entities: &[Entity]) -> (EnumNameMap, Vec<(String, &EnumDef)>) {
+    let mut enum_name_map: EnumNameMap = EnumNameMap::new();
     let mut final_enums: Vec<(String, &EnumDef)> = Vec::new();
     let mut variants_to_name: std::collections::HashMap<Vec<String>, String> =
         std::collections::HashMap::new();
@@ -83,8 +93,10 @@ fn resolve_inline_enums<'a>(
                 let variants: Vec<String> = enum_def.variants.iter().map(|p| p.1.clone()).collect();
 
                 if let Some(existing_name) = variants_to_name.get(&variants) {
-                    enum_name_map
-                        .insert((s.name.clone(), enum_def.name.clone()), existing_name.clone());
+                    enum_name_map.insert(
+                        (s.name.clone(), enum_def.name.clone()),
+                        existing_name.clone(),
+                    );
                 } else {
                     let prefixed = format!("{}{}", s.name, enum_def.name);
                     enum_name_map.insert((s.name.clone(), enum_def.name.clone()), prefixed.clone());
@@ -109,12 +121,19 @@ fn write_enum(out: &mut String, name: &str, enum_def: &EnumDef) -> std::fmt::Res
     writeln!(out, "}}")
 }
 
-fn write_model_rs(entities: &[Entity]) -> Result<String, std::fmt::Error> {
+fn write_model_rs(
+    entities: &[Entity],
+    enum_name_map: &EnumNameMap,
+) -> Result<String, std::fmt::Error> {
     let struct_fields = entities.iter().filter_map(|e| match e {
         Entity::Struct(s) => Some(&s.fields),
         Entity::Enum(_) => None,
     });
-    let has_type = |ty: &str| struct_fields.clone().any(|fields| fields.iter().any(|f| f.rust_type.contains(ty)));
+    let has_type = |ty: &str| {
+        struct_fields
+            .clone()
+            .any(|fields| fields.iter().any(|f| f.rust_type.contains(ty)))
+    };
 
     let needs_datetime = has_type("DateTime");
     let needs_naive_date = has_type("NaiveDate");
@@ -128,7 +147,7 @@ fn write_model_rs(entities: &[Entity]) -> Result<String, std::fmt::Error> {
     };
     let uuid_import = if needs_uuid { "\nuse uuid::Uuid;" } else { "" };
 
-    let (enum_name_map, final_enums) = resolve_inline_enums(entities);
+    let (_, final_enums) = resolve_inline_enums(entities);
 
     let header = header_comment();
     let mut out = format!(
@@ -174,6 +193,11 @@ use serde::{{Deserialize, Serialize}};{uuid_import}
             } else {
                 resolved_type
             };
+            if field.default_value.is_some() {
+                let struct_snake = to_snake_case(&s.name);
+                let fn_name = format!("{struct_snake}_{}", field.name);
+                writeln!(out, "    #[serde(default = \"crate::default::{fn_name}\")]")?;
+            }
             writeln!(
                 out,
                 "    pub {}: {final_type},",
@@ -181,6 +205,177 @@ use serde::{{Deserialize, Serialize}};{uuid_import}
             )?;
         }
         writeln!(out, "}}")?;
+    }
+
+    Ok(out)
+}
+
+/// Convert a JSON default value to a Rust literal string for the given type.
+/// Returns `None` if the combination is unsupported.
+fn format_default_literal(
+    value: &serde_json::Value,
+    rust_type: &str,
+    is_optional: bool,
+    enum_name_map: &EnumNameMap,
+    struct_name: &str,
+) -> Option<String> {
+    let literal = match (value, rust_type) {
+        (serde_json::Value::String(s), "String") => {
+            let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
+            format!("String::from(\"{escaped}\")")
+        }
+        (serde_json::Value::Number(n), "i32" | "i64") => {
+            format!("{}", n.as_i64()?)
+        }
+        (serde_json::Value::Number(n), "f64") => {
+            let f = n.as_f64()?;
+            if f.fract() == 0.0 {
+                format!("{f:.1}_f64")
+            } else {
+                format!("{f}_f64")
+            }
+        }
+        (serde_json::Value::Bool(b), "bool") => format!("{b}"),
+        (serde_json::Value::String(s), "DateTime<Utc>") => {
+            let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
+            format!(
+                "\"{escaped}\".parse::<DateTime<Utc>>().expect(\"hardcoded default from OpenAPI spec\")"
+            )
+        }
+        (serde_json::Value::String(s), "NaiveDate") => {
+            let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
+            format!(
+                "\"{escaped}\".parse::<NaiveDate>().expect(\"hardcoded default from OpenAPI spec\")"
+            )
+        }
+        (serde_json::Value::String(s), "Uuid") => {
+            let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
+            format!(
+                "Uuid::parse_str(\"{escaped}\").expect(\"hardcoded default from OpenAPI spec\")"
+            )
+        }
+        (serde_json::Value::String(s), enum_type) => {
+            // Inline enum: look up the resolved enum name and find the matching variant
+            let fallback = enum_type.to_string();
+            let resolved_enum = enum_name_map
+                .get(&(struct_name.to_string(), enum_type.to_string()))
+                .unwrap_or(&fallback);
+            // Find the variant that matches this default value by checking all enums
+            // The variant pair is (PascalCase, original_value)
+            let variant = find_enum_variant_for_default(s, resolved_enum, enum_name_map)?;
+            format!("{resolved_enum}::{variant}")
+        }
+        _ => return None,
+    };
+    if is_optional {
+        Some(format!("Some({literal})"))
+    } else {
+        Some(literal)
+    }
+}
+
+/// Find the PascalCase variant name for a default string value in an enum.
+/// This is called from `format_default_literal` for inline enum fields.
+fn find_enum_variant_for_default(
+    default_str: &str,
+    _resolved_enum_name: &str,
+    _enum_name_map: &EnumNameMap,
+) -> Option<String> {
+    // Convert the default value to PascalCase to match the variant name.
+    // This works because enum variants are generated as to_pascal_case(original_value)
+    // and the original_value is what appears in the OpenAPI default.
+    Some(crate::parse::to_pascal_case(default_str))
+}
+
+fn write_default_rs(
+    entities: &[Entity],
+    enum_name_map: &EnumNameMap,
+) -> Result<String, std::fmt::Error> {
+    let struct_fields_with_name = entities.iter().filter_map(|e| match e {
+        Entity::Struct(s) => Some((&s.name, &s.fields)),
+        Entity::Enum(_) => None,
+    });
+
+    // Determine which chrono/uuid imports are needed in default functions
+    let needs_datetime = struct_fields_with_name.clone().any(|(_, fields)| {
+        fields
+            .iter()
+            .any(|f| f.default_value.is_some() && f.rust_type.contains("DateTime"))
+    });
+    let needs_naive_date = struct_fields_with_name.clone().any(|(_, fields)| {
+        fields
+            .iter()
+            .any(|f| f.default_value.is_some() && f.rust_type.contains("NaiveDate"))
+    });
+    let needs_uuid = struct_fields_with_name.clone().any(|(_, fields)| {
+        fields
+            .iter()
+            .any(|f| f.default_value.is_some() && f.rust_type == "Uuid")
+    });
+
+    let chrono_import = match (needs_datetime, needs_naive_date) {
+        (true, true) => "use chrono::{DateTime, NaiveDate, Utc};\n",
+        (true, false) => "use chrono::{DateTime, Utc};\n",
+        (false, true) => "use chrono::NaiveDate;\n",
+        (false, false) => "",
+    };
+    let uuid_import = if needs_uuid { "use uuid::Uuid;\n" } else { "" };
+
+    // Check if any default references an enum type from model
+    let needs_model_import = struct_fields_with_name.clone().any(|(name, fields)| {
+        fields.iter().any(|f| {
+            f.default_value.is_some()
+                && enum_name_map.contains_key(&(name.clone(), f.rust_type.clone()))
+        })
+    });
+    let model_import = if needs_model_import {
+        "use crate::model::*;\n"
+    } else {
+        ""
+    };
+
+    let header = header_comment();
+    let mut out = format!(
+        "\
+// {header}
+
+{chrono_import}{uuid_import}{model_import}"
+    );
+
+    for entity in entities {
+        let Entity::Struct(s) = entity else {
+            continue;
+        };
+        let struct_snake = to_snake_case(&s.name);
+        for field in &s.fields {
+            let Some(default_val) = &field.default_value else {
+                continue;
+            };
+            // Resolve the enum type name if applicable
+            let resolved_type = enum_name_map
+                .get(&(s.name.clone(), field.rust_type.clone()))
+                .cloned()
+                .unwrap_or_else(|| field.rust_type.clone());
+            let return_type = if field.is_optional {
+                format!("Option<{resolved_type}>")
+            } else {
+                resolved_type.clone()
+            };
+            let Some(literal) = format_default_literal(
+                default_val,
+                &field.rust_type,
+                field.is_optional,
+                enum_name_map,
+                &s.name,
+            ) else {
+                continue;
+            };
+            let fn_name = format!("{struct_snake}_{}", field.name);
+            writeln!(out)?;
+            writeln!(out, "pub(crate) fn {fn_name}() -> {return_type} {{")?;
+            writeln!(out, "    {literal}")?;
+            writeln!(out, "}}")?;
+        }
     }
 
     Ok(out)
@@ -779,13 +974,14 @@ pretty_assertions = \"1\"
     }
 }
 
-fn generate_lib_rs() -> String {
+fn generate_lib_rs(needs_defaults: bool) -> String {
     let header = header_comment();
+    let default_mod = if needs_defaults { "mod default;\n" } else { "" };
     format!(
         "\
 // {header}
 
-mod model;
+{default_mod}mod model;
 mod validation;
 
 pub use model::*;
@@ -841,6 +1037,7 @@ mod tests {
             rust_type: rust_type.into(),
             is_optional: false,
             constraints,
+            default_value: None,
         }
     }
 
@@ -888,6 +1085,7 @@ mod tests {
                     pattern: None,
                     enumeration: vec![],
                 },
+                default_value: None,
             },
         );
         let krate = write(&[entity], &test_config())?;

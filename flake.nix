@@ -48,7 +48,7 @@
         {
           default = rustPlatform.buildRustPackage {
             pname = "openapi-modelgen";
-            version = "0.1.7";
+            version = "0.1.8";
             src = ./.;
             cargoLock.lockFile = ./Cargo.lock;
           };

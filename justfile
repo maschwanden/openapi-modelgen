@@ -23,11 +23,13 @@ lint:
 # Build the project
 build:
     cargo build
+    # Also build the example
+    cargo build --manifest-path examples/axum-with-custom-extractors/Cargo.toml
 
 # Run the CLI (pass args after --)
 run *args:
     cargo run -- {{args}}
 
 # Run full CI pipeline
-ci: check lint build test
+ci: build check lint test
 

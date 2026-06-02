@@ -12,6 +12,7 @@ paths:
           required: false
           schema:
             type: string
+            default: en
         - name: limit
           in: query
           required: false
@@ -20,6 +21,7 @@ paths:
             format: int32
             minimum: 1
             maximum: 100
+            default: 20
       responses:
         "200":
           description: A list of greetings
@@ -68,7 +70,7 @@ components:
 
     CreateGreetingRequest:
       type: object
-      required: [message, language]
+      required: [message]
       properties:
         message:
           type: string
@@ -80,6 +82,7 @@ components:
             - en
             - de
             - fr
+          default: en
         expires_on:
           type: string
           format: date
