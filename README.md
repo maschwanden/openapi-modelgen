@@ -24,6 +24,7 @@ Given an OpenAPI spec, `openapi-modelgen` produces a self-contained Rust crate w
 | `type: boolean` | `bool` |
 | `type: array` | `Vec<T>` |
 | Inline `enum` (string) | Rust `enum` with `#[serde(rename)]` variants |
+| `oneOf` (top-level, `$ref` members) | Rust `enum`; `#[serde(tag)]` when a `discriminator` is present, `#[serde(untagged)]` otherwise |
 | `nullable` / not `required` | `Option<T>` |
 
 ### Validation constraints
@@ -37,6 +38,28 @@ The generated `validate()` methods enforce:
 - Recursive validation for nested `$ref` objects and `Vec<$ref>`
 
 Validation errors include field paths for nested structs (e.g. `child.name: length 0 is less than minimum 1`).
+
+### Discriminated (`oneOf` + `discriminator`) unions
+
+A top-level `oneOf` with a `discriminator` becomes an internally tagged enum, and `mapping` entries set each variant's wire value. Without a `mapping`, OpenAPI implies the member's schema name, which is used instead.
+
+Because `#[serde(tag = "p")]` makes serde emit and consume the `p` key itself, **the discriminator property is removed from the member structs**. Specs normally declare it on every member; leaving it in place would serialize the key twice and fail to deserialize with `missing field p`. The key is still read and written on the wire — it just lives on the enum rather than the struct.
+
+A member reached *directly* (a field typed with it rather than with the union) therefore has no `p` key: nothing re-adds it, and nothing needs to, since the field's static type already says which member it is. Reaching for one arm of a discriminator instead of the union is usually a sign the field should have been typed with the union.
+
+Members of a discriminated union must be `$ref`s to local object schemas. A member that names a non-object schema is dropped, because serde's internally tagged representation requires each payload to serialize as a map.
+
+### Limitations / not yet supported
+
+- **Inline / field-level `oneOf`**: a `oneOf` used directly as a property's schema (rather than a named schema under `components/schemas`) is not generated as a typed enum — the field falls back to `serde_json::Value`.
+- **Non-`$ref` members of a `oneOf`**: inline-object members of a top-level `oneOf` are skipped; only `$ref`s to local schemas become variants. Members whose target schema was itself not generated, or whose name collides with another variant, are dropped too.
+- **`anyOf` / `allOf`**: not supported. Schemas using them are dropped (top-level) or degrade to `serde_json::Value` (as a field).
+- **Untagged union cardinality is not enforced**: an untagged `oneOf` (no discriminator) deserializes to the first matching variant; the "exactly one match" rule is not validated at runtime.
+- **Request/response bodies, `additionalProperties` (maps), header/cookie parameters, non-local `$ref`s, and non-object/non-string-enum top-level schemas** are not generated.
+
+None of these are silent: every construct that is dropped or degraded is reported as a **diagnostic**. The CLI prints a summary to stderr after generation, and library callers get the full list in `GeneratedCrate.diagnostics`.
+
+Pass `--strict` to make the CLI exit non-zero (code 2) when *anything* was not fully generated — degraded as well as dropped. Degrading still loses information, and some degradations (an external `$ref`, say) leave code that will not compile, so a CI gate for lossless generation has to treat both as failures. Files are always written; only the exit code changes.
 
 ## Installation
 
