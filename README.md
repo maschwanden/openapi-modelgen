@@ -43,8 +43,11 @@ Validation errors include field paths for nested structs (e.g. `child.name: leng
 
 - **Inline / field-level `oneOf`**: a `oneOf` used directly as a property's schema (rather than a named schema under `components/schemas`) is not generated as a typed enum — the field falls back to `serde_json::Value`.
 - **Non-`$ref` members of a `oneOf`**: inline-object members of a top-level `oneOf` are skipped (logged as a warning); only `$ref` members become variants.
-- **`anyOf` / `allOf`**: not supported. Schemas using them are dropped (top-level) or degrade to `serde_json::Value` (as a field), with no error.
+- **`anyOf` / `allOf`**: not supported. Schemas using them are dropped (top-level) or degrade to `serde_json::Value` (as a field).
 - **Untagged union cardinality is not enforced**: an untagged `oneOf` (no discriminator) deserializes to the first matching variant; the "exactly one match" rule is not validated at runtime.
+- **Request/response bodies, `additionalProperties` (maps), header/cookie parameters, non-local `$ref`s, and non-object/non-string-enum top-level schemas** are not generated.
+
+None of these are silent: every construct that is dropped or degraded is reported as a **diagnostic**. The CLI prints a summary to stderr after generation, and library callers get the full list in `GeneratedCrate.diagnostics`. Pass `--strict` to make the CLI exit non-zero when anything was not fully generated (a CI gate for lossless generation).
 
 ## Installation
 

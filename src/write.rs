@@ -1,8 +1,10 @@
 use std::fmt::Write;
 
 use crate::{
-    Config, Constraints, Entity, EntityKind, EnumDef, Field, GeneratedCrate, GeneratedFile,
-    UnionDef, parse::to_snake_case,
+    Config, Constraints, Diagnostic, Entity, EntityKind, EnumDef, Field, GeneratedCrate,
+    GeneratedFile, UnionDef,
+    diagnostics::{Severity, record},
+    parse::to_snake_case,
 };
 
 /// Rust strict keywords that must be escaped with `r#` when used as identifiers.
@@ -42,6 +44,8 @@ pub fn write(entities: &[Entity], config: &Config) -> Result<GeneratedCrate, std
 
     let (enum_name_map, _) = resolve_inline_enums(entities);
 
+    let mut diagnostics = Vec::new();
+
     let mut files = vec![
         GeneratedFile {
             path: "Cargo.toml",
@@ -57,7 +61,7 @@ pub fn write(entities: &[Entity], config: &Config) -> Result<GeneratedCrate, std
         },
         GeneratedFile {
             path: "src/model.rs",
-            content: write_model_rs(entities, &enum_name_map)?,
+            content: write_model_rs(entities, &enum_name_map, &mut diagnostics)?,
         },
     ];
 
@@ -68,7 +72,7 @@ pub fn write(entities: &[Entity], config: &Config) -> Result<GeneratedCrate, std
         });
     }
 
-    Ok(GeneratedCrate { files })
+    Ok(GeneratedCrate { files, diagnostics })
 }
 
 fn header_comment() -> &'static str {
@@ -145,6 +149,7 @@ fn write_union(out: &mut String, union_def: &UnionDef) -> std::fmt::Result {
 fn write_model_rs(
     entities: &[Entity],
     enum_name_map: &EnumNameMap,
+    diagnostics: &mut Vec<Diagnostic>,
 ) -> Result<String, std::fmt::Error> {
     let struct_fields = entities.iter().filter_map(|e| match e {
         Entity::Struct(s) => Some(&s.fields),
@@ -221,10 +226,31 @@ use serde::{{Deserialize, Serialize}};{uuid_import}
             } else {
                 resolved_type
             };
-            if field.default_value.is_some() {
-                let struct_snake = to_snake_case(&s.name);
-                let fn_name = format!("{struct_snake}_{}", field.name);
-                writeln!(out, "    #[serde(default = \"crate::default::{fn_name}\")]")?;
+            if let Some(default_val) = &field.default_value {
+                // Only emit the serde attribute when `write_default_rs` will
+                // actually emit the matching function; otherwise the attribute
+                // would reference a nonexistent path and fail to compile.
+                if format_default_literal(
+                    default_val,
+                    &field.rust_type,
+                    field.is_optional,
+                    enum_name_map,
+                    &s.name,
+                )
+                .is_some()
+                {
+                    let struct_snake = to_snake_case(&s.name);
+                    let fn_name = format!("{struct_snake}_{}", field.name);
+                    writeln!(out, "    #[serde(default = \"crate::default::{fn_name}\")]")?;
+                } else {
+                    record(
+                        diagnostics,
+                        Severity::Degraded,
+                        format!("{}.{}", s.name, field.name),
+                        "default value",
+                        "default value could not be rendered as a Rust literal; no `#[serde(default)]` was emitted",
+                    );
+                }
             }
             writeln!(
                 out,

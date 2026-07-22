@@ -5,11 +5,13 @@
     clippy::too_many_lines
 )]
 
+mod diagnostics;
 mod error;
 mod parse;
 mod write;
 
-pub use parse::parse;
+pub use diagnostics::{Diagnostic, Severity};
+pub use parse::{parse, parse_with_diagnostics};
 pub use write::write;
 
 use openapiv3::OpenAPI;
@@ -31,6 +33,9 @@ pub struct GeneratedFile {
 
 pub struct GeneratedCrate {
     pub files: Vec<GeneratedFile>,
+    /// Spec constructs that could not be fully generated. Empty when the whole
+    /// spec was representable. See [`Diagnostic`].
+    pub diagnostics: Vec<Diagnostic>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -260,9 +265,18 @@ pub fn load_spec(yaml: &str) -> Result<OpenAPI> {
 }
 
 /// Generate a complete crate from an OpenAPI spec and configuration.
+///
+/// The returned [`GeneratedCrate::diagnostics`] lists every spec construct that
+/// could not be fully generated (dropped or degraded). It is empty when the
+/// whole spec was representable.
 pub fn generate(spec: &OpenAPI, config: &Config) -> Result<GeneratedCrate> {
-    let entities = parse(spec);
-    Ok(write(&entities, config)?)
+    let mut diagnostics = Vec::new();
+    let entities = parse_with_diagnostics(spec, &mut diagnostics);
+    let mut generated = write(&entities, config)?;
+    // Parse-time diagnostics come first (spec order), then write-time ones.
+    diagnostics.append(&mut generated.diagnostics);
+    generated.diagnostics = diagnostics;
+    Ok(generated)
 }
 
 #[cfg(test)]
@@ -1015,6 +1029,115 @@ components:
             .current_dir(&dir)
             .status()?;
         assert!(status.success(), "generated crate failed to compile");
+
+        Ok(())
+    }
+
+    /// `generate()` surfaces a diagnostic for every construct it cannot fully
+    /// represent, so library callers (not just the CLI) can see what was lost.
+    #[test]
+    fn generate_reports_diagnostics() -> Result<()> {
+        let yaml = r##"
+openapi: "3.0.3"
+info:
+  title: Test
+  version: "0.1.0"
+paths:
+  /things:
+    post:
+      operationId: createThing
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/Base"
+      parameters:
+        - name: X-Trace
+          in: header
+          required: false
+          schema:
+            type: string
+      responses:
+        "200":
+          description: OK
+components:
+  schemas:
+    Base:
+      type: object
+      properties:
+        id:
+          type: string
+    Derived:
+      allOf:
+        - $ref: "#/components/schemas/Base"
+    Pet:
+      type: object
+      properties:
+        metadata:
+          type: object
+          properties:
+            key:
+              type: string
+"##;
+        let crate_ = generate(&load_spec(yaml)?, &test_config())?;
+
+        let has = |construct: &str, severity: Severity| {
+            crate_
+                .diagnostics
+                .iter()
+                .any(|d| d.construct == construct && d.severity == severity)
+        };
+
+        assert!(has("allOf", Severity::Dropped), "{:?}", crate_.diagnostics);
+        assert!(
+            has("inline object", Severity::Degraded),
+            "{:?}",
+            crate_.diagnostics
+        );
+        assert!(
+            has("header parameter", Severity::Dropped),
+            "{:?}",
+            crate_.diagnostics
+        );
+        assert!(
+            has("request body", Severity::Dropped),
+            "{:?}",
+            crate_.diagnostics
+        );
+
+        // The `Base` and `Pet` object schemas ARE generated despite the losses.
+        let model = file_content(&crate_, "src/model.rs");
+        assert!(model.contains("pub struct Base"));
+        assert!(model.contains("pub struct Pet"));
+
+        Ok(())
+    }
+
+    /// A fully-supported spec yields an empty diagnostics list.
+    #[test]
+    fn generate_clean_spec_has_no_diagnostics() -> Result<()> {
+        let yaml = r#"
+openapi: "3.0.3"
+info:
+  title: Test
+  version: "0.1.0"
+paths: {}
+components:
+  schemas:
+    Thing:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+          minLength: 1
+"#;
+        let crate_ = generate(&load_spec(yaml)?, &test_config())?;
+        assert!(
+            crate_.diagnostics.is_empty(),
+            "expected no diagnostics, got {:?}",
+            crate_.diagnostics
+        );
 
         Ok(())
     }

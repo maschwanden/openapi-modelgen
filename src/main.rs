@@ -8,7 +8,7 @@ use std::{
 
 use clap::Parser;
 
-use openapi_modelgen::{Config, generate, load_spec};
+use openapi_modelgen::{Config, Severity, generate, load_spec};
 
 #[derive(Parser)]
 #[command(version)]
@@ -30,6 +30,12 @@ struct Args {
     /// If not set, uses fixed version numbers.
     #[arg(long, default_value_t = false)]
     workspace: bool,
+
+    /// Fail (non-zero exit) if any part of the spec could not be fully
+    /// generated. Files are still written; the process exits with an error so
+    /// CI can gate on lossless generation.
+    #[arg(long, default_value_t = false)]
+    strict: bool,
 }
 
 fn main() {
@@ -94,6 +100,8 @@ fn main() {
         process::exit(1);
     });
 
+    report_diagnostics(&generated.diagnostics);
+
     for file in &generated.files {
         let path = crate_dir.join(file.path);
         if let Some(parent) = path.parent() {
@@ -102,6 +110,33 @@ fn main() {
         }
         fs::write(&path, &file.content)
             .unwrap_or_else(|e| panic!("failed to write {}: {e}", path.display()));
+    }
+
+    if args.strict && !generated.diagnostics.is_empty() {
+        eprintln!(
+            "error: --strict: spec was not fully representable ({} diagnostic(s))",
+            generated.diagnostics.len()
+        );
+        process::exit(2);
+    }
+}
+
+/// Print a summary of anything the generator could not fully represent.
+fn report_diagnostics(diagnostics: &[openapi_modelgen::Diagnostic]) {
+    if diagnostics.is_empty() {
+        return;
+    }
+    let dropped = diagnostics
+        .iter()
+        .filter(|d| d.severity == Severity::Dropped)
+        .count();
+    let degraded = diagnostics.len() - dropped;
+    eprintln!(
+        "warning: {} spec construct(s) were not fully generated ({dropped} dropped, {degraded} degraded):",
+        diagnostics.len()
+    );
+    for diagnostic in diagnostics {
+        eprintln!("  - {diagnostic}");
     }
 }
 
