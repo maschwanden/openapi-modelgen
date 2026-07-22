@@ -1050,7 +1050,10 @@ paths:
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/Base"
+              type: object
+              properties:
+                note:
+                  type: string
       parameters:
         - name: X-Trace
           in: header

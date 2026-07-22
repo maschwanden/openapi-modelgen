@@ -75,7 +75,7 @@ pub fn parse_with_diagnostics(spec: &OpenAPI, diagnostics: &mut Vec<Diagnostic>)
         ];
         for (method, op) in ops {
             let Some(op) = op else { continue };
-            diagnose_operation_bodies(op, method, path, diagnostics);
+            diagnose_operation_bodies(op, spec.components.as_ref(), method, path, diagnostics);
             if let Some(entity) =
                 parse_query(op, spec.components.as_ref(), method, path, diagnostics)
             {
@@ -139,45 +139,95 @@ fn diagnose_unsupported_schema(name: &str, schema: &Schema, diagnostics: &mut Ve
     record(diagnostics, Severity::Dropped, path, construct, reason);
 }
 
+/// Whether any media type in a body carries an *inline* schema.
+///
+/// A `$ref` content schema resolves to a component we generate, so it is not a
+/// loss; only an inline schema (`ReferenceOr::Item`) has no generated type.
+fn content_has_inline_schema<'a>(
+    content: impl IntoIterator<Item = &'a openapiv3::MediaType>,
+) -> bool {
+    content
+        .into_iter()
+        .any(|media| matches!(media.schema, Some(ReferenceOr::Item(_))))
+}
+
 /// Record diagnostics for operation request/response bodies, which are never
-/// parsed into types. Reported once per operation (a per-field walk would be
-/// far noisier), and only when a body actually carries a schema we are dropping.
+/// parsed into types.
+///
+/// A body is a loss only when its content schema is *inline*; a `$ref` content
+/// schema points at a component we do generate. `$ref` bodies/responses are
+/// resolved against `components`, then the same inline check applies — an
+/// unresolvable `$ref` (external or missing) is itself a genuine loss.
 fn diagnose_operation_bodies(
     op: &Operation,
+    components: Option<&openapiv3::Components>,
     method: &str,
     path: &str,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     let location = format!("{} {path}", method.to_uppercase());
 
-    if let Some(ReferenceOr::Item(body)) = &op.request_body
-        && body.content.values().any(|m| m.schema.is_some())
-    {
-        record(
-            diagnostics,
-            Severity::Dropped,
-            location.clone(),
-            "request body",
-            "request body schemas are not generated; define the type under components.schemas and $ref it",
-        );
+    // Request body: a loss only when its content schema is inline. A `$ref`
+    // body is resolved first; an unresolvable `$ref` is itself a loss.
+    if let Some(ref_or) = &op.request_body {
+        let resolved = match ref_or {
+            ReferenceOr::Item(body) => Some(body),
+            ReferenceOr::Reference { reference } => {
+                let body = resolve_request_body(reference, components);
+                if body.is_none() {
+                    record(
+                        diagnostics,
+                        Severity::Dropped,
+                        location.clone(),
+                        "request body",
+                        format!("could not resolve request body $ref `{reference}`"),
+                    );
+                }
+                body
+            }
+        };
+        if let Some(body) = resolved
+            && content_has_inline_schema(body.content.values())
+        {
+            record(
+                diagnostics,
+                Severity::Dropped,
+                location.clone(),
+                "request body",
+                "inline request body schema is not generated as a named type",
+            );
+        }
     }
 
-    let response_has_schema = op
-        .responses
-        .responses
-        .values()
-        .filter_map(|r| match r {
-            ReferenceOr::Item(response) => Some(response),
-            ReferenceOr::Reference { .. } => None,
-        })
-        .any(|response| response.content.values().any(|m| m.schema.is_some()));
-    if response_has_schema {
+    // Responses (every status plus the `default` response).
+    let mut response_has_inline_schema = false;
+    for response_ref in op.responses.responses.values().chain(&op.responses.default) {
+        match response_ref {
+            ReferenceOr::Item(response) => {
+                response_has_inline_schema |= content_has_inline_schema(response.content.values());
+            }
+            ReferenceOr::Reference { reference } => match resolve_response(reference, components) {
+                Some(response) => {
+                    response_has_inline_schema |=
+                        content_has_inline_schema(response.content.values());
+                }
+                None => record(
+                    diagnostics,
+                    Severity::Dropped,
+                    location.clone(),
+                    "response body",
+                    format!("could not resolve response $ref `{reference}`"),
+                ),
+            },
+        }
+    }
+    if response_has_inline_schema {
         record(
             diagnostics,
             Severity::Dropped,
             location,
             "response body",
-            "response body schemas are not generated; define the type under components.schemas and $ref it",
+            "inline response body schema is not generated as a named type",
         );
     }
 }
@@ -566,6 +616,30 @@ fn resolve_parameter_ref<'a>(
     let params = &components.as_ref()?.parameters;
     match params.get(name)? {
         ReferenceOr::Item(p) => Some(p),
+        ReferenceOr::Reference { .. } => None,
+    }
+}
+
+/// Resolve a `$ref` like `#/components/requestBodies/Foo` to the request body.
+fn resolve_request_body<'a>(
+    reference: &str,
+    components: Option<&'a openapiv3::Components>,
+) -> Option<&'a openapiv3::RequestBody> {
+    let name = reference.strip_prefix("#/components/requestBodies/")?;
+    match components?.request_bodies.get(name)? {
+        ReferenceOr::Item(b) => Some(b),
+        ReferenceOr::Reference { .. } => None,
+    }
+}
+
+/// Resolve a `$ref` like `#/components/responses/Foo` to the response.
+fn resolve_response<'a>(
+    reference: &str,
+    components: Option<&'a openapiv3::Components>,
+) -> Option<&'a openapiv3::Response> {
+    let name = reference.strip_prefix("#/components/responses/")?;
+    match components?.responses.get(name)? {
+        ReferenceOr::Item(r) => Some(r),
         ReferenceOr::Reference { .. } => None,
     }
 }
@@ -1415,6 +1489,202 @@ components:
 "
         ))?;
         assert!(diags.is_empty(), "expected no diagnostics, got {diags:?}");
+
+        Ok(())
+    }
+
+    fn has_construct(diags: &[Diagnostic], construct: &str) -> bool {
+        diags.iter().any(|d| d.construct == construct)
+    }
+
+    /// A `$ref` request body and a `$ref` response schema point at components we
+    /// generate — no loss, no diagnostic. (Regression for the false-positive.)
+    #[test]
+    fn diagnostic_ref_bodies_are_clean() -> Result<()> {
+        let diags = diagnostics_for(&format!(
+            r##"{MINIMAL_HEADER}
+paths:
+  /things:
+    post:
+      operationId: createThing
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Base'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Base'
+components:
+  schemas:
+    Base:
+      type: object
+      properties:
+        id:
+          type: string
+"##
+        ))?;
+        assert!(diags.is_empty(), "expected no diagnostics, got {diags:?}");
+
+        Ok(())
+    }
+
+    /// An inline request body schema has no generated type → diagnosed.
+    #[test]
+    fn diagnostic_inline_request_body() -> Result<()> {
+        let diags = diagnostics_for(&format!(
+            r#"{MINIMAL_HEADER}
+paths:
+  /things:
+    post:
+      operationId: createThing
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                note:
+                  type: string
+      responses:
+        "200":
+          description: OK
+components:
+  schemas: {{}}
+"#
+        ))?;
+        let d = find_diag(&diags, "request body");
+        assert_eq!(d.severity, Severity::Dropped);
+        assert_eq!(d.path, "POST /things");
+
+        Ok(())
+    }
+
+    /// The `default` response is inspected too, not just numbered statuses.
+    #[test]
+    fn diagnostic_inline_default_response() -> Result<()> {
+        let diags = diagnostics_for(&format!(
+            r#"{MINIMAL_HEADER}
+paths:
+  /things:
+    get:
+      operationId: getThings
+      responses:
+        default:
+          description: fallback
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code:
+                    type: integer
+components:
+  schemas: {{}}
+"#
+        ))?;
+        let d = find_diag(&diags, "response body");
+        assert_eq!(d.severity, Severity::Dropped);
+        assert_eq!(d.path, "GET /things");
+
+        Ok(())
+    }
+
+    /// An unresolvable `$ref` request body is itself a genuine loss.
+    #[test]
+    fn diagnostic_unresolvable_ref_request_body() -> Result<()> {
+        let diags = diagnostics_for(&format!(
+            r##"{MINIMAL_HEADER}
+paths:
+  /things:
+    post:
+      operationId: createThing
+      requestBody:
+        $ref: '#/components/requestBodies/Missing'
+      responses:
+        "200":
+          description: OK
+components:
+  schemas: {{}}
+"##
+        ))?;
+        let d = find_diag(&diags, "request body");
+        assert_eq!(d.severity, Severity::Dropped);
+        assert!(
+            d.reason.contains("could not resolve"),
+            "reason: {}",
+            d.reason
+        );
+
+        Ok(())
+    }
+
+    /// A `$ref` request body that resolves is judged by its content: inline
+    /// content → diagnosed, all-`$ref` content → clean.
+    #[test]
+    fn diagnostic_resolvable_ref_request_body() -> Result<()> {
+        // Resolves to a component whose content schema is inline → diagnosed.
+        let inline = diagnostics_for(&format!(
+            r##"{MINIMAL_HEADER}
+paths:
+  /things:
+    post:
+      operationId: createThing
+      requestBody:
+        $ref: '#/components/requestBodies/InlineBody'
+      responses:
+        "200":
+          description: OK
+components:
+  schemas: {{}}
+  requestBodies:
+    InlineBody:
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              note:
+                type: string
+"##
+        ))?;
+        assert!(has_construct(&inline, "request body"));
+
+        // Resolves to a component whose content schema is a $ref → clean.
+        let refd = diagnostics_for(&format!(
+            r##"{MINIMAL_HEADER}
+paths:
+  /things:
+    post:
+      operationId: createThing
+      requestBody:
+        $ref: '#/components/requestBodies/RefBody'
+      responses:
+        "200":
+          description: OK
+components:
+  schemas:
+    Base:
+      type: object
+      properties:
+        id:
+          type: string
+  requestBodies:
+    RefBody:
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Base'
+"##
+        ))?;
+        assert!(
+            !has_construct(&refd, "request body"),
+            "resolved $ref-content body should be clean, got {refd:?}"
+        );
 
         Ok(())
     }
