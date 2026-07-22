@@ -1191,4 +1191,60 @@ components:
 
         Ok(())
     }
+
+    /// Regression: an inline-enum `default` naming no variant used to emit a
+    /// nonexistent enum variant (uncompilable). It is now dropped, so the
+    /// generated crate compiles. Ignored by default (shells out to cargo check).
+    #[test]
+    #[ignore = "shells out to cargo check; run manually with --ignored"]
+    fn bad_enum_default_compiles() -> Result<()> {
+        use std::process::Command;
+
+        let yaml = r#"
+openapi: "3.0.3"
+info:
+  title: Test
+  version: "0.1.0"
+paths: {}
+components:
+  schemas:
+    Foo:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [active, inactive]
+          default: unknown
+"#;
+        let config = Config {
+            crate_name: "bad_enum_default_compile_test".to_string(),
+            use_workspace: false,
+        };
+        let crate_ = generate(&load_spec(yaml)?, &config)?;
+
+        // The bad default is reported and dropped.
+        assert!(
+            crate_
+                .diagnostics
+                .iter()
+                .any(|d| d.construct == "enum default"),
+            "expected an enum-default diagnostic: {:?}",
+            crate_.diagnostics
+        );
+
+        let dir = std::env::temp_dir().join("openapi_modelgen_bad_enum_default_compile_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src"))?;
+        for file in &crate_.files {
+            std::fs::write(dir.join(file.path), &file.content)?;
+        }
+
+        let status = Command::new("cargo")
+            .arg("check")
+            .current_dir(&dir)
+            .status()?;
+        assert!(status.success(), "generated crate failed to compile");
+
+        Ok(())
+    }
 }

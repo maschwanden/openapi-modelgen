@@ -14,7 +14,13 @@ use crate::{
 /// know which spec constructs could not be generated.
 pub fn parse(spec: &OpenAPI) -> Vec<Entity> {
     let mut diagnostics = Vec::new();
-    parse_with_diagnostics(spec, &mut diagnostics)
+    let entities = parse_with_diagnostics(spec, &mut diagnostics);
+    // This convenience wrapper drops the diagnostics, so surface them via the
+    // log (at `warn`) for callers that don't want the returned list.
+    for diagnostic in &diagnostics {
+        log::warn!("{diagnostic}");
+    }
+    entities
 }
 
 /// Parse an OpenAPI spec into a list of entities, recording a [`Diagnostic`]
@@ -273,7 +279,7 @@ fn parse_schema(name: &str, schema: &Schema, diagnostics: &mut Vec<Diagnostic>) 
 
         // Extract default value (only for supported types).
         let is_enum_field = enums.iter().any(|e| e.name == rust_type);
-        let default_value = match field_ref {
+        let mut default_value = match field_ref {
             ReferenceOr::Item(field_schema) => extract_default(
                 &field_schema.schema_data.default,
                 &rust_type,
@@ -284,6 +290,25 @@ fn parse_schema(name: &str, schema: &Schema, diagnostics: &mut Vec<Diagnostic>) 
             ),
             ReferenceOr::Reference { .. } => None,
         };
+
+        // An inline enum default must name one of the enum's values; otherwise
+        // codegen would emit a nonexistent variant (uncompilable). Drop it.
+        if is_enum_field && let Some(serde_json::Value::String(value)) = &default_value {
+            let valid = enums
+                .iter()
+                .find(|e| e.name == rust_type)
+                .is_some_and(|e| e.variants.iter().any(|(_, original)| original == value));
+            if !valid {
+                record(
+                    diagnostics,
+                    Severity::Degraded,
+                    format!("{name}.{field_name}"),
+                    "enum default",
+                    format!("default `{value}` is not one of the enum's values; ignored"),
+                );
+                default_value = None;
+            }
+        }
 
         let has_default = default_value.is_some();
         let is_optional = if has_default {
@@ -358,9 +383,15 @@ fn parse_enum(field_name: &str, schema: &Schema) -> Option<EnumDef> {
 ///
 /// Each member is expected to be a `$ref` to another schema; each becomes an
 /// enum variant wrapping the referenced type. Inline (non-`$ref`) members are
-/// out of scope for now — they are skipped with a warning. If a `discriminator`
-/// is present, the union is internally tagged and any `mapping` entries rename
-/// the corresponding variants on the wire.
+/// out of scope for now — they are skipped. If a `discriminator` is present, the
+/// union is internally tagged and any `mapping` entries rename the corresponding
+/// variants on the wire.
+///
+/// Per-member skip diagnostics are buffered and only flushed when a union is
+/// actually produced (a mix of `$ref` variants and skipped inline members). If
+/// *no* variant survives, nothing is recorded here so the single schema-level
+/// drop in `diagnose_unsupported_schema` fires instead — avoiding a double
+/// report for the same schema.
 fn parse_one_of(name: &str, schema: &Schema, diagnostics: &mut Vec<Diagnostic>) -> Option<Entity> {
     let SchemaKind::OneOf { one_of } = &schema.schema_kind else {
         return None;
@@ -369,10 +400,11 @@ fn parse_one_of(name: &str, schema: &Schema, diagnostics: &mut Vec<Diagnostic>) 
     let discriminator = schema.schema_data.discriminator.as_ref();
 
     let mut variants = Vec::new();
+    let mut skipped = Vec::new();
     for member in one_of {
         let ReferenceOr::Reference { reference } = member else {
             record(
-                diagnostics,
+                &mut skipped,
                 Severity::Dropped,
                 format!("components.schemas.{name}"),
                 "inline oneOf member",
@@ -401,6 +433,7 @@ fn parse_one_of(name: &str, schema: &Schema, diagnostics: &mut Vec<Diagnostic>) 
         return None;
     }
 
+    diagnostics.append(&mut skipped);
     Some(Entity::Union(UnionDef {
         name: name.to_string(),
         variants,
@@ -1201,8 +1234,8 @@ properties:
     }
 
     /// Helper: build a spec with `Cat`/`Dog` object schemas plus a caller-supplied
-    /// composite schema, and return the parsed entities.
-    fn spec_with_composite(composite_yaml: &str) -> Result<Vec<Entity>> {
+    /// composite schema, and return the loaded `OpenAPI`.
+    fn spec_with_composite_spec(composite_yaml: &str) -> Result<OpenAPI> {
         let composite = composite_yaml
             .lines()
             .map(|line| {
@@ -1217,7 +1250,12 @@ properties:
         let full = format!(
             "{MINIMAL_HEADER}paths: {{}}\ncomponents:\n  schemas:\n    Cat:\n      type: object\n      properties:\n        name:\n          type: string\n    Dog:\n      type: object\n      properties:\n        name:\n          type: string\n{composite}\n"
         );
-        Ok(parse(&load_spec(&full)?))
+        Ok(load_spec(&full)?)
+    }
+
+    /// Same as [`spec_with_composite_spec`] but returns the parsed entities.
+    fn spec_with_composite(composite_yaml: &str) -> Result<Vec<Entity>> {
+        Ok(parse(&spec_with_composite_spec(composite_yaml)?))
     }
 
     fn find_union<'a>(entities: &'a [Entity], name: &str) -> &'a UnionDef {
@@ -1684,6 +1722,124 @@ components:
         assert!(
             !has_construct(&refd, "request body"),
             "resolved $ref-content body should be clean, got {refd:?}"
+        );
+
+        Ok(())
+    }
+
+    fn count_construct(diags: &[Diagnostic], construct: &str) -> usize {
+        diags.iter().filter(|d| d.construct == construct).count()
+    }
+
+    /// An all-inline `oneOf` (no `$ref` members) yields exactly ONE diagnostic —
+    /// the schema-level drop — not one per skipped member plus the drop.
+    #[test]
+    fn diagnostic_all_inline_one_of_single() -> Result<()> {
+        let spec = spec_with_composite_spec(
+            "\
+Pet:
+  oneOf:
+    - type: object
+      properties:
+        a:
+          type: string
+    - type: object
+      properties:
+        b:
+          type: string",
+        )?;
+        let mut diagnostics = Vec::new();
+        let entities = parse_with_diagnostics(&spec, &mut diagnostics);
+
+        // No union produced, and exactly one schema-level drop for the oneOf.
+        assert!(!entities.iter().any(|e| matches!(e, Entity::Union(_))));
+        assert_eq!(count_construct(&diagnostics, "oneOf"), 1, "{diagnostics:?}");
+        assert_eq!(
+            count_construct(&diagnostics, "inline oneOf member"),
+            0,
+            "{diagnostics:?}"
+        );
+
+        Ok(())
+    }
+
+    /// A mixed `oneOf` (one `$ref` + one inline member) produces the union AND
+    /// one diagnostic per skipped inline member (no schema-level drop).
+    #[test]
+    fn diagnostic_mixed_one_of_per_member() -> Result<()> {
+        let spec = spec_with_composite_spec(
+            "\
+Pet:
+  oneOf:
+    - $ref: '#/components/schemas/Cat'
+    - type: object
+      properties:
+        b:
+          type: string",
+        )?;
+        let mut diagnostics = Vec::new();
+        let entities = parse_with_diagnostics(&spec, &mut diagnostics);
+        assert!(
+            entities
+                .iter()
+                .any(|e| matches!(e, Entity::Union(u) if u.name == "Pet")),
+            "union should still be produced"
+        );
+        assert_eq!(
+            count_construct(&diagnostics, "inline oneOf member"),
+            1,
+            "{diagnostics:?}"
+        );
+        assert_eq!(count_construct(&diagnostics, "oneOf"), 0, "{diagnostics:?}");
+
+        Ok(())
+    }
+
+    /// An inline-enum `default` that names no variant is dropped with a
+    /// diagnostic (rather than emitting a nonexistent, uncompilable variant).
+    #[test]
+    fn diagnostic_bad_enum_default_dropped() -> Result<()> {
+        let diags = diagnostics_for(&format!(
+            r"{MINIMAL_HEADER}
+paths: {{}}
+components:
+  schemas:
+    Foo:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [active, inactive]
+          default: unknown
+"
+        ))?;
+        let d = find_diag(&diags, "enum default");
+        assert_eq!(d.severity, Severity::Degraded);
+        assert_eq!(d.path, "Foo.status");
+
+        Ok(())
+    }
+
+    /// A valid inline-enum `default` produces no diagnostic.
+    #[test]
+    fn diagnostic_good_enum_default_is_clean() -> Result<()> {
+        let diags = diagnostics_for(&format!(
+            r"{MINIMAL_HEADER}
+paths: {{}}
+components:
+  schemas:
+    Foo:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [active, inactive]
+          default: active
+"
+        ))?;
+        assert!(
+            !has_construct(&diags, "enum default"),
+            "valid enum default should be clean, got {diags:?}"
         );
 
         Ok(())

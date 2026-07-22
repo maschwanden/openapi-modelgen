@@ -57,12 +57,12 @@ impl fmt::Display for Diagnostic {
     }
 }
 
-/// Record a diagnostic: push it onto the collector (the source of truth,
-/// returned from [`crate::generate`]) and mirror it to the log at `info` level.
+/// Record a diagnostic by pushing it onto the collector.
 ///
-/// The log mirror lets library callers who install a logger observe losses in
-/// real time; the CLI presents them via its own summary, so mirroring at `info`
-/// (below the CLI's default `warn` floor) avoids printing each one twice.
+/// The collector is the single source of truth: it is returned from
+/// [`crate::generate`] and logged at `warn` by the [`crate::parse`] convenience
+/// wrapper. Recording does not log here — that would double-print on the CLI,
+/// which renders its own summary from the returned list.
 pub(crate) fn record(
     diagnostics: &mut Vec<Diagnostic>,
     severity: Severity,
@@ -70,12 +70,10 @@ pub(crate) fn record(
     construct: impl Into<String>,
     reason: impl Into<String>,
 ) {
-    let diagnostic = Diagnostic {
+    diagnostics.push(Diagnostic {
         path: path.into(),
         construct: construct.into(),
         reason: reason.into(),
         severity,
-    };
-    log::info!("{diagnostic}");
-    diagnostics.push(diagnostic);
+    });
 }
