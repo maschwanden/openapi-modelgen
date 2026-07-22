@@ -5,7 +5,10 @@ use std::sync::Mutex;
 
 use axum::{Json, Router, http::StatusCode, routing::get};
 use chrono::Utc;
-use hello_world_openapi::{CreateGreetingRequest, Greeting, GreetingLanguage, ListGreetingsQuery};
+use hello_world_openapi::{
+    Attachment, CreateGreetingRequest, Greeting, GreetingLanguage, ImageAttachment, LinkAttachment,
+    ListGreetingsQuery,
+};
 
 use crate::{
     error::AppError,
@@ -62,6 +65,7 @@ async fn create_greeting(
         created_at: Utc::now(),
         expires_on: body.expires_on,
         tags: body.tags,
+        attachment: None,
     };
 
     Ok((StatusCode::CREATED, Json(greeting)))
@@ -76,6 +80,12 @@ fn seed_greetings() -> Vec<Greeting> {
             created_at: Utc::now(),
             expires_on: None,
             tags: Some(vec!["welcome".into()]),
+            // Untagged oneOf: this greeting carries an image attachment.
+            attachment: Some(Attachment::ImageAttachment(ImageAttachment {
+                url: "https://example.com/hello.png".into(),
+                width: 640,
+                height: 480,
+            })),
         },
         Greeting {
             id: 1,
@@ -84,6 +94,11 @@ fn seed_greetings() -> Vec<Greeting> {
             created_at: Utc::now(),
             expires_on: None,
             tags: Some(vec!["welcome".into()]),
+            // Untagged oneOf: this greeting carries a link attachment.
+            attachment: Some(Attachment::LinkAttachment(LinkAttachment {
+                href: "https://example.com/de".into(),
+                title: Some("Mehr erfahren".into()),
+            })),
         },
         Greeting {
             id: 2,
@@ -92,6 +107,7 @@ fn seed_greetings() -> Vec<Greeting> {
             created_at: Utc::now(),
             expires_on: None,
             tags: None,
+            attachment: None,
         },
     ]
 }

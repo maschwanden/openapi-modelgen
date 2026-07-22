@@ -67,6 +67,8 @@ components:
             type: string
           maxItems: 10
           uniqueItems: true
+        attachment:
+          $ref: "#/components/schemas/Attachment"
 
     CreateGreetingRequest:
       type: object
@@ -92,3 +94,67 @@ components:
             type: string
           maxItems: 10
           uniqueItems: true
+        delivery:
+          $ref: "#/components/schemas/DeliveryChannel"
+
+    # Tagged oneOf: how the greeting should be delivered. The `channel`
+    # property discriminates which member applies, and `mapping` gives the
+    # wire values used in the payload.
+    DeliveryChannel:
+      oneOf:
+        - $ref: "#/components/schemas/EmailDelivery"
+        - $ref: "#/components/schemas/SmsDelivery"
+      discriminator:
+        propertyName: channel
+        mapping:
+          email: "#/components/schemas/EmailDelivery"
+          sms: "#/components/schemas/SmsDelivery"
+
+    EmailDelivery:
+      type: object
+      required: [channel, address]
+      properties:
+        channel:
+          type: string
+        address:
+          type: string
+          minLength: 3
+
+    SmsDelivery:
+      type: object
+      required: [channel, phone_number]
+      properties:
+        channel:
+          type: string
+        phone_number:
+          type: string
+          pattern: '^\+[0-9]+$'
+
+    # Untagged oneOf: an optional attachment is either an image or a link.
+    # With no discriminator, deserialization tries each member in order.
+    Attachment:
+      oneOf:
+        - $ref: "#/components/schemas/ImageAttachment"
+        - $ref: "#/components/schemas/LinkAttachment"
+
+    ImageAttachment:
+      type: object
+      required: [url, width, height]
+      properties:
+        url:
+          type: string
+        width:
+          type: integer
+          format: int32
+        height:
+          type: integer
+          format: int32
+
+    LinkAttachment:
+      type: object
+      required: [href]
+      properties:
+        href:
+          type: string
+        title:
+          type: string

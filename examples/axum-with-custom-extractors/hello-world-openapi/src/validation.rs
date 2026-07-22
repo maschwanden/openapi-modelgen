@@ -1,6 +1,7 @@
 // This file is @generated — do not edit manually.
 
 use crate::model::*;
+use regex::Regex;
 
 #[derive(Debug)]
 pub struct ValidationError {
@@ -71,6 +72,16 @@ impl Validation for Greeting {
                 }
             }
         }
+        if let Some(val) = &self.attachment
+            && let Err(nested) = (*val).validate()
+        {
+            errors.extend(
+                nested
+                    .details
+                    .into_iter()
+                    .map(|e| format!("attachment.{e}")),
+            );
+        }
         if errors.is_empty() {
             Ok(())
         } else {
@@ -111,6 +122,11 @@ impl Validation for CreateGreetingRequest {
                 }
             }
         }
+        if let Some(val) = &self.delivery
+            && let Err(nested) = (*val).validate()
+        {
+            errors.extend(nested.details.into_iter().map(|e| format!("delivery.{e}")));
+        }
         if errors.is_empty() {
             Ok(())
         } else {
@@ -118,6 +134,65 @@ impl Validation for CreateGreetingRequest {
         }
     }
 }
+
+impl Validation for DeliveryChannel {
+    fn validate(&self) -> Result<(), ValidationError> {
+        match self {
+            Self::EmailDelivery(inner) => inner.validate(),
+            Self::SmsDelivery(inner) => inner.validate(),
+        }
+    }
+}
+
+impl Validation for EmailDelivery {
+    fn validate(&self) -> Result<(), ValidationError> {
+        let mut errors = Vec::new();
+        if self.address.chars().count() < 3 {
+            errors.push(format!(
+                "address: length {} is less than minimum 3",
+                self.address.chars().count()
+            ));
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(ValidationError { details: errors })
+        }
+    }
+}
+
+impl Validation for SmsDelivery {
+    fn validate(&self) -> Result<(), ValidationError> {
+        let mut errors = Vec::new();
+        if !Regex::new("^\\+[0-9]+$")
+            .unwrap()
+            .is_match(&self.phone_number)
+        {
+            errors.push(format!(
+                "phone_number: value '{}' does not match pattern '^\\+[0-9]+$'",
+                self.phone_number
+            ));
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(ValidationError { details: errors })
+        }
+    }
+}
+
+impl Validation for Attachment {
+    fn validate(&self) -> Result<(), ValidationError> {
+        match self {
+            Self::ImageAttachment(inner) => inner.validate(),
+            Self::LinkAttachment(inner) => inner.validate(),
+        }
+    }
+}
+
+impl Validation for ImageAttachment {}
+
+impl Validation for LinkAttachment {}
 
 impl Validation for ListGreetingsQuery {
     fn validate(&self) -> Result<(), ValidationError> {
@@ -129,10 +204,7 @@ impl Validation for ListGreetingsQuery {
             ));
         }
         if self.limit > 100 {
-            errors.push(format!(
-                "limit: value {} exceeds maximum 100",
-                self.limit
-            ));
+            errors.push(format!("limit: value {} exceeds maximum 100", self.limit));
         }
         if errors.is_empty() {
             Ok(())
