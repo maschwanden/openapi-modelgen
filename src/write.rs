@@ -45,6 +45,9 @@ pub fn write(entities: &[Entity], config: &Config) -> Result<GeneratedCrate, std
     let (enum_name_map, _) = resolve_inline_enums(entities);
 
     let mut diagnostics = Vec::new();
+    // Render every field default once; both model.rs and default.rs consume the
+    // result, and unrenderable defaults are reported here (a single site).
+    let default_literals = compute_default_literals(entities, &enum_name_map, &mut diagnostics);
 
     let mut files = vec![
         GeneratedFile {
@@ -61,14 +64,14 @@ pub fn write(entities: &[Entity], config: &Config) -> Result<GeneratedCrate, std
         },
         GeneratedFile {
             path: "src/model.rs",
-            content: write_model_rs(entities, &enum_name_map, &mut diagnostics)?,
+            content: write_model_rs(entities, &enum_name_map, &default_literals)?,
         },
     ];
 
     if needs_defaults {
         files.push(GeneratedFile {
             path: "src/default.rs",
-            content: write_default_rs(entities, &enum_name_map)?,
+            content: write_default_rs(entities, &enum_name_map, &default_literals)?,
         });
     }
 
@@ -84,6 +87,50 @@ fn header_comment() -> &'static str {
 /// Returns a map from `(entity_name, raw_enum_name)` → resolved prefixed name,
 /// plus a vec of `(resolved_name, &EnumDef)` for the unique enums to emit.
 type EnumNameMap = std::collections::HashMap<(String, String), String>;
+
+/// Rendered default-value literals keyed by `(struct name, field name)`.
+/// A missing key means the field has no default, or its default could not be
+/// rendered (reported once by [`compute_default_literals`]).
+type DefaultLiterals = std::collections::HashMap<(String, String), String>;
+
+/// Render the Rust literal for every field default up front. Fields whose
+/// default cannot be represented are omitted and reported once as a Degraded
+/// diagnostic — the single source for both `model.rs` (whether to emit
+/// `#[serde(default)]`) and `default.rs` (the function body).
+fn compute_default_literals(
+    entities: &[Entity],
+    enum_name_map: &EnumNameMap,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> DefaultLiterals {
+    let mut literals = DefaultLiterals::new();
+    for entity in entities {
+        let Entity::Struct(s) = entity else { continue };
+        for field in &s.fields {
+            let Some(default_val) = &field.default_value else {
+                continue;
+            };
+            match format_default_literal(
+                default_val,
+                &field.rust_type,
+                field.is_optional,
+                enum_name_map,
+                &s.name,
+            ) {
+                Some(literal) => {
+                    literals.insert((s.name.clone(), field.name.clone()), literal);
+                }
+                None => record(
+                    diagnostics,
+                    Severity::Degraded,
+                    format!("{}.{}", s.name, field.name),
+                    "default value",
+                    "default value could not be rendered as a Rust literal; no `#[serde(default)]` was emitted",
+                ),
+            }
+        }
+    }
+    literals
+}
 
 fn resolve_inline_enums(entities: &[Entity]) -> (EnumNameMap, Vec<(String, &EnumDef)>) {
     let mut enum_name_map: EnumNameMap = EnumNameMap::new();
@@ -149,7 +196,7 @@ fn write_union(out: &mut String, union_def: &UnionDef) -> std::fmt::Result {
 fn write_model_rs(
     entities: &[Entity],
     enum_name_map: &EnumNameMap,
-    diagnostics: &mut Vec<Diagnostic>,
+    default_literals: &DefaultLiterals,
 ) -> Result<String, std::fmt::Error> {
     let struct_fields = entities.iter().filter_map(|e| match e {
         Entity::Struct(s) => Some(&s.fields),
@@ -226,31 +273,12 @@ use serde::{{Deserialize, Serialize}};{uuid_import}
             } else {
                 resolved_type
             };
-            if let Some(default_val) = &field.default_value {
-                // Only emit the serde attribute when `write_default_rs` will
-                // actually emit the matching function; otherwise the attribute
-                // would reference a nonexistent path and fail to compile.
-                if format_default_literal(
-                    default_val,
-                    &field.rust_type,
-                    field.is_optional,
-                    enum_name_map,
-                    &s.name,
-                )
-                .is_some()
-                {
-                    let struct_snake = to_snake_case(&s.name);
-                    let fn_name = format!("{struct_snake}_{}", field.name);
-                    writeln!(out, "    #[serde(default = \"crate::default::{fn_name}\")]")?;
-                } else {
-                    record(
-                        diagnostics,
-                        Severity::Degraded,
-                        format!("{}.{}", s.name, field.name),
-                        "default value",
-                        "default value could not be rendered as a Rust literal; no `#[serde(default)]` was emitted",
-                    );
-                }
+            // Emit the serde attribute only when a literal was rendered (so it
+            // never references a `default.rs` function that was skipped).
+            if default_literals.contains_key(&(s.name.clone(), field.name.clone())) {
+                let struct_snake = to_snake_case(&s.name);
+                let fn_name = format!("default_{struct_snake}_{}", field.name);
+                writeln!(out, "    #[serde(default = \"crate::default::{fn_name}\")]")?;
             }
             writeln!(
                 out,
@@ -344,6 +372,7 @@ fn find_enum_variant_for_default(
 fn write_default_rs(
     entities: &[Entity],
     enum_name_map: &EnumNameMap,
+    default_literals: &DefaultLiterals,
 ) -> Result<String, std::fmt::Error> {
     let struct_fields_with_name = entities.iter().filter_map(|e| match e {
         Entity::Struct(s) => Some((&s.name, &s.fields)),
@@ -402,7 +431,9 @@ fn write_default_rs(
         };
         let struct_snake = to_snake_case(&s.name);
         for field in &s.fields {
-            let Some(default_val) = &field.default_value else {
+            // Skip fields with no default, and those whose default could not be
+            // rendered (absent from the map — already reported in `write`).
+            let Some(literal) = default_literals.get(&(s.name.clone(), field.name.clone())) else {
                 continue;
             };
             // Resolve the enum type name if applicable
@@ -415,16 +446,7 @@ fn write_default_rs(
             } else {
                 resolved_type.clone()
             };
-            let Some(literal) = format_default_literal(
-                default_val,
-                &field.rust_type,
-                field.is_optional,
-                enum_name_map,
-                &s.name,
-            ) else {
-                continue;
-            };
-            let fn_name = format!("{struct_snake}_{}", field.name);
+            let fn_name = format!("default_{struct_snake}_{}", field.name);
             writeln!(out)?;
             writeln!(out, "pub(crate) fn {fn_name}() -> {return_type} {{")?;
             writeln!(out, "    {literal}")?;

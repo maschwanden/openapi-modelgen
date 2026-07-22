@@ -31,9 +31,9 @@ struct Args {
     #[arg(long, default_value_t = false)]
     workspace: bool,
 
-    /// Fail (non-zero exit) if any part of the spec could not be fully
-    /// generated. Files are still written; the process exits with an error so
-    /// CI can gate on lossless generation.
+    /// Fail (non-zero exit) if any part of the spec was dropped (a construct
+    /// that produced no output). Degraded-only runs still succeed. Files are
+    /// always written; the exit code lets CI gate on lossless generation.
     #[arg(long, default_value_t = false)]
     strict: bool,
 }
@@ -112,12 +112,16 @@ fn main() {
             .unwrap_or_else(|e| panic!("failed to write {}: {e}", path.display()));
     }
 
-    if args.strict && !generated.diagnostics.is_empty() {
-        eprintln!(
-            "error: --strict: spec was not fully representable ({} diagnostic(s))",
-            generated.diagnostics.len()
-        );
-        process::exit(2);
+    if args.strict {
+        let dropped = generated
+            .diagnostics
+            .iter()
+            .filter(|d| d.severity == Severity::Dropped)
+            .count();
+        if dropped > 0 {
+            eprintln!("error: --strict: {dropped} spec construct(s) were dropped");
+            process::exit(2);
+        }
     }
 }
 
