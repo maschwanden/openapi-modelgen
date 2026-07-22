@@ -24,6 +24,7 @@ Given an OpenAPI spec, `openapi-modelgen` produces a self-contained Rust crate w
 | `type: boolean` | `bool` |
 | `type: array` | `Vec<T>` |
 | Inline `enum` (string) | Rust `enum` with `#[serde(rename)]` variants |
+| `oneOf` (top-level, `$ref` members) | Rust `enum`; `#[serde(tag)]` when a `discriminator` is present, `#[serde(untagged)]` otherwise |
 | `nullable` / not `required` | `Option<T>` |
 
 ### Validation constraints

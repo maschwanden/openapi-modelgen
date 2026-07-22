@@ -2,7 +2,7 @@ use std::fmt::Write;
 
 use crate::{
     Config, Constraints, Entity, EntityKind, EnumDef, Field, GeneratedCrate, GeneratedFile,
-    parse::to_snake_case,
+    UnionDef, parse::to_snake_case,
 };
 
 /// Rust strict keywords that must be escaped with `r#` when used as identifiers.
@@ -17,7 +17,7 @@ const RUST_KEYWORDS: &[&str] = &[
 pub fn write(entities: &[Entity], config: &Config) -> Result<GeneratedCrate, std::fmt::Error> {
     let struct_fields = entities.iter().filter_map(|e| match e {
         Entity::Struct(s) => Some(s.fields.as_slice()),
-        Entity::Enum(_) => None,
+        Entity::Enum(_) | Entity::Union(_) => None,
     });
 
     let needs_regex = struct_fields.clone().any(|fields| {
@@ -121,13 +121,34 @@ fn write_enum(out: &mut String, name: &str, enum_def: &EnumDef) -> std::fmt::Res
     writeln!(out, "}}")
 }
 
+/// Emit a union enum from a top-level `oneOf` schema. Internally tagged when
+/// `tag` is set (a discriminator was present), untagged otherwise.
+fn write_union(out: &mut String, union_def: &UnionDef) -> std::fmt::Result {
+    writeln!(out)?;
+    writeln!(out, "#[derive(Debug, Clone, Serialize, Deserialize)]")?;
+    match &union_def.tag {
+        Some(prop) => writeln!(out, "#[serde(tag = \"{prop}\")]")?,
+        None => writeln!(out, "#[serde(untagged)]")?,
+    }
+    writeln!(out, "pub enum {} {{", union_def.name)?;
+    for variant in &union_def.variants {
+        if let Some(wire) = &variant.wire_value
+            && *wire != variant.variant_name
+        {
+            writeln!(out, "    #[serde(rename = \"{wire}\")]")?;
+        }
+        writeln!(out, "    {}({}),", variant.variant_name, variant.inner_type)?;
+    }
+    writeln!(out, "}}")
+}
+
 fn write_model_rs(
     entities: &[Entity],
     enum_name_map: &EnumNameMap,
 ) -> Result<String, std::fmt::Error> {
     let struct_fields = entities.iter().filter_map(|e| match e {
         Entity::Struct(s) => Some(&s.fields),
-        Entity::Enum(_) => None,
+        Entity::Enum(_) | Entity::Union(_) => None,
     });
     let has_type = |ty: &str| {
         struct_fields
@@ -166,6 +187,13 @@ use serde::{{Deserialize, Serialize}};{uuid_import}
     }
     for (enum_name, enum_def) in &final_enums {
         write_enum(&mut out, enum_name, enum_def)?;
+    }
+
+    // Emit unions (from top-level oneOf schemas)
+    for entity in entities {
+        if let Entity::Union(union_def) = entity {
+            write_union(&mut out, union_def)?;
+        }
     }
 
     for entity in entities {
@@ -293,7 +321,7 @@ fn write_default_rs(
 ) -> Result<String, std::fmt::Error> {
     let struct_fields_with_name = entities.iter().filter_map(|e| match e {
         Entity::Struct(s) => Some((&s.name, &s.fields)),
-        Entity::Enum(_) => None,
+        Entity::Enum(_) | Entity::Union(_) => None,
     });
 
     // Determine which chrono/uuid imports are needed in default functions
@@ -442,6 +470,7 @@ impl<T: Validation> Validation for Vec<T> {{
                 writeln!(out)?;
                 writeln!(out, "impl Validation for {} {{}}", e.name)?;
             }
+            Entity::Union(u) => write_union_validation_impl(&mut out, u)?,
         }
     }
 
@@ -490,6 +519,32 @@ fn write_validation_impl(out: &mut String, name: &str, fields: &[Field]) -> std:
     writeln!(out, "    }}")?;
     writeln!(out, "}}")?;
     Ok(())
+}
+
+/// Write the `impl Validation` block for a union entity, delegating to the
+/// active variant's inner `validate()`.
+fn write_union_validation_impl(out: &mut String, union_def: &UnionDef) -> std::fmt::Result {
+    writeln!(out)?;
+    if union_def.variants.is_empty() {
+        writeln!(out, "impl Validation for {} {{}}", union_def.name)?;
+        return Ok(());
+    }
+    writeln!(out, "impl Validation for {} {{", union_def.name)?;
+    writeln!(
+        out,
+        "    fn validate(&self) -> Result<(), ValidationError> {{"
+    )?;
+    writeln!(out, "        match self {{")?;
+    for variant in &union_def.variants {
+        writeln!(
+            out,
+            "            Self::{}(inner) => inner.validate(),",
+            variant.variant_name
+        )?;
+    }
+    writeln!(out, "        }}")?;
+    writeln!(out, "    }}")?;
+    writeln!(out, "}}")
 }
 
 /// Write `errors.push(format!("...", args));` across multiple lines for readability.

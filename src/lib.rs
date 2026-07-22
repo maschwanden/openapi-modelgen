@@ -61,6 +61,8 @@ pub enum Entity {
     Struct(StructDef),
     /// A standalone enum generated from a top-level string enum schema.
     Enum(EnumDef),
+    /// A tagged/untagged union generated from a top-level `oneOf` schema.
+    Union(UnionDef),
 }
 
 #[derive(Debug, PartialEq)]
@@ -81,6 +83,31 @@ pub struct EnumDef {
     pub name: String,
     /// Variants in PascalCase with their original snake_case values.
     pub variants: Vec<(String, String)>,
+}
+
+/// A union type generated from a top-level `oneOf` schema.
+///
+/// When `tag` is `Some(prop)` (a `discriminator` was present), it maps to a
+/// serde internally-tagged enum (`#[serde(tag = "prop")]`); otherwise it maps
+/// to an untagged enum (`#[serde(untagged)]`).
+#[derive(Debug, PartialEq)]
+pub struct UnionDef {
+    /// Enum name in PascalCase (e.g. `Pet`).
+    pub name: String,
+    /// One variant per `oneOf` member.
+    pub variants: Vec<UnionVariant>,
+    /// `Some(property_name)` for a discriminated (tagged) union, `None` for untagged.
+    pub tag: Option<String>,
+}
+
+#[derive(Debug, PartialEq)]
+pub struct UnionVariant {
+    /// Variant name in PascalCase (e.g. `Dog`).
+    pub variant_name: String,
+    /// The referenced Rust type wrapped by this variant (e.g. `Dog`).
+    pub inner_type: String,
+    /// Wire value from a `discriminator.mapping` entry, if it renames the variant.
+    pub wire_value: Option<String>,
 }
 
 /// Constraints extracted from a single field's OpenAPI schema.
@@ -876,6 +903,118 @@ components:
             !lib.contains("mod default;"),
             "no default module when no defaults: {lib}"
         );
+
+        Ok(())
+    }
+
+    const ONE_OF_SPEC: &str = r##"
+openapi: "3.0.3"
+info:
+  title: Test
+  version: "0.1.0"
+paths: {}
+components:
+  schemas:
+    Cat:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+          minLength: 1
+    Dog:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+    Pet:
+      oneOf:
+        - $ref: '#/components/schemas/Cat'
+        - $ref: '#/components/schemas/Dog'
+      discriminator:
+        propertyName: petType
+        mapping:
+          cat: '#/components/schemas/Cat'
+          dog: '#/components/schemas/Dog'
+    Shape:
+      oneOf:
+        - $ref: '#/components/schemas/Cat'
+        - $ref: '#/components/schemas/Dog'
+"##;
+
+    /// A top-level `oneOf` with a discriminator + mapping becomes an internally
+    /// tagged enum; without a discriminator it becomes an untagged enum. Both
+    /// get a `Validation` impl that delegates to the active variant.
+    #[test]
+    fn one_of_union_schema() -> Result<()> {
+        let crate_ = generate(&load_spec(ONE_OF_SPEC)?, &test_config())?;
+        let model = file_content(&crate_, "src/model.rs");
+
+        // Discriminated union → internally tagged, with renamed variants.
+        assert!(
+            model.contains("#[serde(tag = \"petType\")]\npub enum Pet {"),
+            "discriminated union should be internally tagged: {model}"
+        );
+        assert!(
+            model.contains("#[serde(rename = \"cat\")]\n    Cat(Cat),"),
+            "mapping should rename the Cat variant: {model}"
+        );
+        assert!(
+            model.contains("#[serde(rename = \"dog\")]\n    Dog(Dog),"),
+            "mapping should rename the Dog variant: {model}"
+        );
+
+        // Undiscriminated union → untagged.
+        assert!(
+            model.contains("#[serde(untagged)]\npub enum Shape {"),
+            "union without discriminator should be untagged: {model}"
+        );
+
+        let validation = file_content(&crate_, "src/validation.rs");
+        assert!(
+            validation.contains("impl Validation for Pet {"),
+            "union should get a Validation impl: {validation}"
+        );
+        assert!(
+            validation.contains("Self::Cat(inner) => inner.validate(),")
+                && validation.contains("Self::Dog(inner) => inner.validate(),"),
+            "union validation should delegate to each variant: {validation}"
+        );
+
+        Ok(())
+    }
+
+    /// Compile-check the generated crate for a `oneOf` spec end-to-end.
+    ///
+    /// Ignored by default: it shells out to `cargo check` (needs a `cargo`
+    /// toolchain and, on a cold cache, network access), which the fast unit
+    /// suite deliberately avoids. Run explicitly with:
+    /// `cargo test -- --ignored one_of_generated_crate_compiles`.
+    #[test]
+    #[ignore = "shells out to cargo check; run manually with --ignored"]
+    fn one_of_generated_crate_compiles() -> Result<()> {
+        use std::process::Command;
+
+        // Fixed versions (not workspace refs) so the crate builds standalone.
+        let config = Config {
+            crate_name: "one_of_compile_test".to_string(),
+            use_workspace: false,
+        };
+        let crate_ = generate(&load_spec(ONE_OF_SPEC)?, &config)?;
+
+        let dir = std::env::temp_dir().join("openapi_modelgen_one_of_compile_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src"))?;
+        for file in &crate_.files {
+            std::fs::write(dir.join(file.path), &file.content)?;
+        }
+
+        let status = Command::new("cargo")
+            .arg("check")
+            .current_dir(&dir)
+            .status()?;
+        assert!(status.success(), "generated crate failed to compile");
 
         Ok(())
     }

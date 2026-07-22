@@ -3,7 +3,7 @@ use openapiv3::{
     VariantOrUnknownOrEmpty,
 };
 
-use crate::{Constraints, Entity, EntityKind, EnumDef, Field, StructDef};
+use crate::{Constraints, Entity, EntityKind, EnumDef, Field, StructDef, UnionDef, UnionVariant};
 
 /// Parse an OpenAPI spec into a list of entities.
 pub fn parse(spec: &OpenAPI) -> Vec<Entity> {
@@ -20,6 +20,7 @@ pub fn parse(spec: &OpenAPI) -> Vec<Entity> {
                 })
                 .filter_map(|(name, schema)| {
                     parse_schema(name, schema)
+                        .or_else(|| parse_one_of(name, schema))
                         .or_else(|| parse_enum(name, schema).map(Entity::Enum))
                 }),
         );
@@ -156,6 +157,56 @@ fn parse_enum(field_name: &str, schema: &Schema) -> Option<EnumDef> {
     } else {
         None
     }
+}
+
+/// Parse a top-level `oneOf` schema into a union entity.
+///
+/// Each member is expected to be a `$ref` to another schema; each becomes an
+/// enum variant wrapping the referenced type. Inline (non-`$ref`) members are
+/// out of scope for now — they are skipped with a warning. If a `discriminator`
+/// is present, the union is internally tagged and any `mapping` entries rename
+/// the corresponding variants on the wire.
+fn parse_one_of(name: &str, schema: &Schema) -> Option<Entity> {
+    let SchemaKind::OneOf { one_of } = &schema.schema_kind else {
+        return None;
+    };
+
+    let discriminator = schema.schema_data.discriminator.as_ref();
+
+    let mut variants = Vec::new();
+    for member in one_of {
+        let ReferenceOr::Reference { reference } = member else {
+            log::warn!(
+                "{name}: inline (non-$ref) oneOf member is not yet supported and was skipped"
+            );
+            continue;
+        };
+        let ref_name = resolve_ref_name(reference);
+
+        // If a discriminator mapping points at this member's ref, use the
+        // mapping key as the wire value.
+        let wire_value = discriminator.and_then(|d| {
+            d.mapping.iter().find_map(|(key, target)| {
+                (resolve_ref_name(target) == ref_name).then(|| key.clone())
+            })
+        });
+
+        variants.push(UnionVariant {
+            variant_name: to_pascal_case(&ref_name),
+            inner_type: ref_name,
+            wire_value,
+        });
+    }
+
+    if variants.is_empty() {
+        return None;
+    }
+
+    Some(Entity::Union(UnionDef {
+        name: name.to_string(),
+        variants,
+        tag: discriminator.map(|d| d.property_name.clone()),
+    }))
 }
 
 fn parse_query(
@@ -787,6 +838,128 @@ properties:
     type: number",
         )?;
         assert_eq!(first_struct_fields(&parse(&spec))[0].rust_type, "f64");
+
+        Ok(())
+    }
+
+    /// Helper: build a spec with `Cat`/`Dog` object schemas plus a caller-supplied
+    /// composite schema, and return the parsed entities.
+    fn spec_with_composite(composite_yaml: &str) -> Result<Vec<Entity>> {
+        let composite = composite_yaml
+            .lines()
+            .map(|line| {
+                if line.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!("    {line}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let full = format!(
+            "{MINIMAL_HEADER}paths: {{}}\ncomponents:\n  schemas:\n    Cat:\n      type: object\n      properties:\n        name:\n          type: string\n    Dog:\n      type: object\n      properties:\n        name:\n          type: string\n{composite}\n"
+        );
+        Ok(parse(&load_spec(&full)?))
+    }
+
+    fn find_union<'a>(entities: &'a [Entity], name: &str) -> &'a UnionDef {
+        entities
+            .iter()
+            .find_map(|e| match e {
+                Entity::Union(u) if u.name == name => Some(u),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("expected Entity::Union named {name}"))
+    }
+
+    #[test]
+    fn parse_one_of_untagged() -> Result<()> {
+        let entities = spec_with_composite(
+            "\
+Pet:
+  oneOf:
+    - $ref: '#/components/schemas/Cat'
+    - $ref: '#/components/schemas/Dog'",
+        )?;
+        let union = find_union(&entities, "Pet");
+        assert_eq!(union.tag, None);
+        assert_eq!(
+            union.variants,
+            vec![
+                UnionVariant {
+                    variant_name: "Cat".into(),
+                    inner_type: "Cat".into(),
+                    wire_value: None,
+                },
+                UnionVariant {
+                    variant_name: "Dog".into(),
+                    inner_type: "Dog".into(),
+                    wire_value: None,
+                },
+            ]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn parse_one_of_discriminator_no_mapping() -> Result<()> {
+        let entities = spec_with_composite(
+            "\
+Pet:
+  oneOf:
+    - $ref: '#/components/schemas/Cat'
+    - $ref: '#/components/schemas/Dog'
+  discriminator:
+    propertyName: petType",
+        )?;
+        let union = find_union(&entities, "Pet");
+        assert_eq!(union.tag, Some("petType".into()));
+        // No mapping → no variant is renamed on the wire.
+        assert!(union.variants.iter().all(|v| v.wire_value.is_none()));
+        assert_eq!(
+            union
+                .variants
+                .iter()
+                .map(|v| v.variant_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Cat", "Dog"]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn parse_one_of_discriminator_with_mapping() -> Result<()> {
+        let entities = spec_with_composite(
+            "\
+Pet:
+  oneOf:
+    - $ref: '#/components/schemas/Cat'
+    - $ref: '#/components/schemas/Dog'
+  discriminator:
+    propertyName: petType
+    mapping:
+      cat: '#/components/schemas/Cat'
+      dog: '#/components/schemas/Dog'",
+        )?;
+        let union = find_union(&entities, "Pet");
+        assert_eq!(union.tag, Some("petType".into()));
+        assert_eq!(
+            union.variants,
+            vec![
+                UnionVariant {
+                    variant_name: "Cat".into(),
+                    inner_type: "Cat".into(),
+                    wire_value: Some("cat".into()),
+                },
+                UnionVariant {
+                    variant_name: "Dog".into(),
+                    inner_type: "Dog".into(),
+                    wire_value: Some("dog".into()),
+                },
+            ]
+        );
 
         Ok(())
     }
