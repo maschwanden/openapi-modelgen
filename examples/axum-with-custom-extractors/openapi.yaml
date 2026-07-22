@@ -128,7 +128,7 @@ components:
           type: string
         phone_number:
           type: string
-          pattern: '^\+[0-9]+$'
+          pattern: '^\+[1-9]\d{1,14}$'
 
     # Untagged oneOf: an optional attachment is either an image or a link.
     # With no discriminator, deserialization tries each member in order.

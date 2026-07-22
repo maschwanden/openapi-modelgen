@@ -1,7 +1,7 @@
 // This file is @generated — do not edit manually.
 
-use crate::model::*;
 use regex::Regex;
+use crate::model::*;
 
 #[derive(Debug)]
 pub struct ValidationError {
@@ -75,12 +75,7 @@ impl Validation for Greeting {
         if let Some(val) = &self.attachment
             && let Err(nested) = (*val).validate()
         {
-            errors.extend(
-                nested
-                    .details
-                    .into_iter()
-                    .map(|e| format!("attachment.{e}")),
-            );
+            errors.extend(nested.details.into_iter().map(|e| format!("attachment.{e}")));
         }
         if errors.is_empty() {
             Ok(())
@@ -164,12 +159,9 @@ impl Validation for EmailDelivery {
 impl Validation for SmsDelivery {
     fn validate(&self) -> Result<(), ValidationError> {
         let mut errors = Vec::new();
-        if !Regex::new("^\\+[0-9]+$")
-            .unwrap()
-            .is_match(&self.phone_number)
-        {
+        if !Regex::new("^\\+[1-9]\\d{1,14}$").unwrap().is_match(&self.phone_number) {
             errors.push(format!(
-                "phone_number: value '{}' does not match pattern '^\\+[0-9]+$'",
+                "phone_number: value '{}' does not match pattern '^\\+[1-9]\\d{{1,14}}$'",
                 self.phone_number
             ));
         }
@@ -204,7 +196,10 @@ impl Validation for ListGreetingsQuery {
             ));
         }
         if self.limit > 100 {
-            errors.push(format!("limit: value {} exceeds maximum 100", self.limit));
+            errors.push(format!(
+                "limit: value {} exceeds maximum 100",
+                self.limit
+            ));
         }
         if errors.is_empty() {
             Ok(())

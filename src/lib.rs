@@ -1018,4 +1018,51 @@ components:
 
         Ok(())
     }
+
+    /// Regression: a `pattern` with brace quantifiers used to emit an invalid
+    /// `format!` string (braces read as placeholders) and fail to compile.
+    /// Ignored by default — shells out to `cargo check`. Run with:
+    /// `cargo test -- --ignored pattern_with_braces_compiles`.
+    #[test]
+    #[ignore = "shells out to cargo check; run manually with --ignored"]
+    fn pattern_with_braces_compiles() -> Result<()> {
+        use std::process::Command;
+
+        let yaml = r#"
+openapi: "3.0.3"
+info:
+  title: Test
+  version: "0.1.0"
+paths: {}
+components:
+  schemas:
+    Contact:
+      type: object
+      required: [phone]
+      properties:
+        phone:
+          type: string
+          pattern: '^\+[1-9]\d{1,14}$'
+"#;
+        let config = Config {
+            crate_name: "brace_pattern_compile_test".to_string(),
+            use_workspace: false,
+        };
+        let crate_ = generate(&load_spec(yaml)?, &config)?;
+
+        let dir = std::env::temp_dir().join("openapi_modelgen_brace_pattern_compile_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src"))?;
+        for file in &crate_.files {
+            std::fs::write(dir.join(file.path), &file.content)?;
+        }
+
+        let status = Command::new("cargo")
+            .arg("check")
+            .current_dir(&dir)
+            .status()?;
+        assert!(status.success(), "generated crate failed to compile");
+
+        Ok(())
+    }
 }

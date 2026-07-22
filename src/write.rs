@@ -664,10 +664,15 @@ fn write_field_checks(out: &mut String, field: &Field) -> std::fmt::Result {
                     &format!("!Regex::new(\"{escaped}\").unwrap().is_match(&{accessor})"),
                     guard.as_deref(),
                 )?;
+                // The message is a `format!` string literal, so any `{`/`}` in the
+                // pattern (e.g. brace quantifiers like `{1,14}`) must be doubled to
+                // avoid being parsed as format placeholders. The `Regex::new` arg
+                // above must keep the un-doubled braces.
+                let escaped_msg = escaped.replace('{', "{{").replace('}', "}}");
                 write_error_push(
                     out,
                     indent,
-                    &format!("\"{name}: value '{{}}' does not match pattern '{escaped}'\""),
+                    &format!("\"{name}: value '{{}}' does not match pattern '{escaped_msg}'\""),
                     &accessor,
                 )?;
                 writeln!(out, "{indent}}}")?;
@@ -1120,6 +1125,42 @@ mod tests {
         assert!(
             cargo.contains("regex.workspace = true"),
             "missing regex dep: {cargo}"
+        );
+
+        Ok(())
+    }
+
+    /// A `pattern` containing brace quantifiers (e.g. `{1,14}`) must have its
+    /// braces doubled in the `format!` error-message literal — but NOT in the
+    /// `Regex::new(...)` argument, where doubling would corrupt the regex.
+    #[test]
+    fn write_pattern_with_brace_quantifier() -> Result {
+        let entity = single_field_entity(
+            "Foo",
+            EntityKind::Schema,
+            required_field(
+                "phone",
+                "String",
+                Constraints::String {
+                    min_length: None,
+                    max_length: None,
+                    pattern: Some(r"^\+[1-9]\d{1,14}$".into()),
+                    enumeration: vec![],
+                },
+            ),
+        );
+        let krate = write(&[entity], &test_config())?;
+        let v = find_file(&krate, "src/validation.rs");
+
+        // Regex::new argument keeps the un-doubled braces (a valid regex).
+        assert!(
+            v.contains(r#"Regex::new("^\\+[1-9]\\d{1,14}$")"#),
+            "regex arg should keep un-doubled braces: {v}"
+        );
+        // The error-message format literal doubles the braces.
+        assert!(
+            v.contains(r#"does not match pattern '^\\+[1-9]\\d{{1,14}}$'"#),
+            "message literal should double the braces: {v}"
         );
 
         Ok(())
