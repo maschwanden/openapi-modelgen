@@ -1,6 +1,8 @@
-# axum-with-custom-extractors
+# axum-models-only
 
-Like [`axum-hello-world`](../axum-hello-world), but with custom `JsonV` and `QueryV` extractors that validate request data automatically. Handlers never call `.validate()` themselves -- invalid requests are rejected before the handler runs.
+This example generates **only the models** (types + `Validation` impls) from the spec — you write the axum server by hand. Its notable technique: custom `JsonV` and `QueryV` extractors that validate request data automatically, so handlers never call `.validate()` themselves — invalid requests are rejected before the handler runs.
+
+For the counterpart where the **server** is generated too (an `Api` trait + axum adapter), see [`axum-generated-server`](../axum-generated-server).
 
 ## How it works
 
@@ -50,8 +52,8 @@ From the openapi-modelgen project root:
 
 ```sh
 cargo run -- \
-  --input examples/axum-with-custom-extractors/openapi.yaml \
-  --output-dir examples/axum-with-custom-extractors \
+  --input examples/axum-models-only/openapi.yaml \
+  --output-dir examples/axum-models-only \
   --crate-name hello-world-openapi \
   --workspace
 ```
@@ -59,7 +61,7 @@ cargo run -- \
 ## Running
 
 ```sh
-cd examples/axum-with-custom-extractors
+cd examples/axum-models-only
 cargo run -p hello-world
 
 # In another terminal:

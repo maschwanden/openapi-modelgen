@@ -1,0 +1,8 @@
+generate:
+  model: true
+  server: true
+  axum-server: true
+server-style: strict
+operations:
+  deleteNote:
+    server-style: manual

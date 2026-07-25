@@ -229,6 +229,7 @@ dependencies = [
  "log",
  "openapiv3",
  "pretty_assertions",
+ "serde",
  "serde_json",
  "serde_yaml",
 ]

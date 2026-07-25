@@ -1,6 +1,7 @@
 #![allow(clippy::doc_markdown)]
 
 use std::{
+    collections::HashMap,
     env, fs,
     path::{Path, PathBuf},
     process,
@@ -8,7 +9,9 @@ use std::{
 
 use clap::Parser;
 
-use openapi_modelgen::{Config, Severity, generate, load_spec};
+use openapi_modelgen::{
+    Config, FileConfig, ServerStyle, Severity, check_target_deps, generate, load_spec,
+};
 
 #[derive(Parser)]
 #[command(version)]
@@ -36,6 +39,17 @@ struct Args {
     /// always written; the exit code lets CI gate on lossless generation.
     #[arg(long, default_value_t = false)]
     strict: bool,
+
+    /// Also generate `src/server.rs` with a framework-agnostic `Api` trait and
+    /// an opt-in axum adapter. Shorthand for `generate: { server, axum-server }`
+    /// in the config file; overrides it when both are given.
+    #[arg(long, default_value_t = false)]
+    server: bool,
+
+    /// Optional `openapi-modelgen.yaml` config file selecting generation targets
+    /// (`generate: { model, server, axum-server }`) and `server-style`.
+    #[arg(long)]
+    config: Option<PathBuf>,
 }
 
 fn main() {
@@ -82,9 +96,63 @@ fn main() {
 
     let crate_dir = output_dir.join(&args.crate_name);
 
+    // Generation targets: config file (if any), then the `--server` CLI shorthand.
+    let mut emit_model = true;
+    let mut emit_server = false;
+    let mut emit_axum = false;
+    let mut server_style = ServerStyle::Strict;
+    let mut operation_styles: HashMap<String, ServerStyle> = HashMap::new();
+
+    if let Some(cfg_path) = &args.config {
+        let cfg_path = expand_tilde(cfg_path);
+        let text = fs::read_to_string(&cfg_path).unwrap_or_else(|e| {
+            eprintln!("error: failed to read config '{}': {e}", cfg_path.display());
+            process::exit(1);
+        });
+        let file_config = FileConfig::parse(&text).unwrap_or_else(|e| {
+            eprintln!(
+                "error: failed to parse config '{}': {e}",
+                cfg_path.display()
+            );
+            process::exit(1);
+        });
+        emit_model = file_config.generate.model;
+        emit_server = file_config.generate.server;
+        emit_axum = file_config.generate.axum_server;
+        if let Some(style) = file_config.server_style {
+            server_style = style;
+        }
+        operation_styles = file_config.operation_styles();
+    }
+
+    // `--server` is a shorthand for enabling both server targets, overriding config.
+    if args.server {
+        emit_server = true;
+        emit_axum = true;
+    }
+
+    if let Err(e) = check_target_deps(emit_model, emit_server, emit_axum) {
+        eprintln!("error: invalid generation targets: {e}");
+        process::exit(1);
+    }
+
+    if operation_styles.is_empty() && server_style == ServerStyle::Strict && !emit_server {
+        // No server config in effect and no server requested — nothing to warn about.
+    } else if !emit_server && !emit_axum {
+        eprintln!(
+            "warning: server-style/operations in the config are ignored because neither \
+             `server` nor `axum-server` generation is enabled"
+        );
+    }
+
     let config = Config {
         crate_name: args.crate_name,
         use_workspace: args.workspace,
+        emit_model,
+        emit_server,
+        emit_axum,
+        server_style,
+        operation_styles,
     };
 
     let content = fs::read_to_string(&input).unwrap_or_else(|e| {

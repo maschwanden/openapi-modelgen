@@ -50,10 +50,7 @@ fn logging_contract() {
     log::set_max_level(log::LevelFilter::Warn);
 
     let spec = load_spec(LOSSY_SPEC).unwrap();
-    let config = Config {
-        crate_name: "log_test".to_string(),
-        use_workspace: true,
-    };
+    let config = Config::new("log_test".to_string(), true);
 
     // generate() returns diagnostics and must NOT log (the CLI prints its own
     // summary from the returned list; logging too would double-print).

@@ -116,7 +116,7 @@ generated/
 
 ### Examples
 
-Given [this OpenAPI spec](examples/axum-hello-world/openapi.yaml), `openapi-modelgen` generates types like these:
+Given [this OpenAPI spec](examples/axum-models-only/openapi.yaml), `openapi-modelgen` generates types like these:
 
 ```rust
 pub struct Greeting {
@@ -162,7 +162,8 @@ async fn create_greeting(
 
 Full working examples:
 
-- [`examples/axum-with-custom-extractors`](examples/axum-with-custom-extractors): Basic axum workspace using generated types in handlers with custom `JsonV`/`QueryV` extractors that validate automatically (handlers never call `.validate()`)
+- [`examples/axum-models-only`](examples/axum-models-only): Generate **models only**; write the axum server by hand, with custom `JsonV`/`QueryV` extractors that validate automatically (handlers never call `.validate()`)
+- [`examples/axum-generated-server`](examples/axum-generated-server): Generate the **server** too — an `Api` trait (one method per operation) plus an axum adapter, so a forgotten route is a compile error; shows spec-driven auth and a `manual` opt-out via `openapi-modelgen.yaml`
 
 ## Development
 

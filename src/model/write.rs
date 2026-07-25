@@ -1,103 +1,28 @@
 use std::fmt::Write;
 
+use super::{Constraints, Entity, EntityKind, EnumDef, Field, UnionDef};
+use crate::common::{escape_keyword, header_comment, to_pascal_case, to_snake_case};
 use crate::{
-    Config, Constraints, Diagnostic, Entity, EntityKind, EnumDef, Field, GeneratedCrate,
-    GeneratedFile, UnionDef,
+    Diagnostic,
     diagnostics::{Severity, record},
-    parse::to_snake_case,
 };
-
-/// Rust strict keywords that must be escaped with `r#` when used as identifiers.
-const RUST_KEYWORDS: &[&str] = &[
-    "as", "async", "await", "break", "const", "continue", "crate", "dyn", "else", "enum", "extern",
-    "false", "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub",
-    "ref", "return", "self", "Self", "static", "struct", "super", "trait", "true", "type",
-    "unsafe", "use", "where", "while",
-];
-
-/// Generate a complete crate from a list of parsed entities.
-pub fn write(entities: &[Entity], config: &Config) -> Result<GeneratedCrate, std::fmt::Error> {
-    let struct_fields = entities.iter().filter_map(|e| match e {
-        Entity::Struct(s) => Some(s.fields.as_slice()),
-        Entity::Enum(_) | Entity::Union(_) => None,
-    });
-
-    let needs_regex = struct_fields.clone().any(|fields| {
-        fields.iter().any(|f| {
-            matches!(
-                &f.constraints,
-                Constraints::String {
-                    pattern: Some(_),
-                    ..
-                }
-            )
-        })
-    });
-
-    let needs_uuid = struct_fields
-        .clone()
-        .any(|fields| fields.iter().any(|f| f.rust_type == "Uuid"));
-
-    let needs_defaults = struct_fields
-        .clone()
-        .any(|fields| fields.iter().any(|f| f.default_value.is_some()));
-
-    let (enum_name_map, _) = resolve_inline_enums(entities);
-
-    let mut diagnostics = Vec::new();
-    // Render every field default once; both model.rs and default.rs consume the
-    // result, and unrenderable defaults are reported here (a single site).
-    let default_literals = compute_default_literals(entities, &enum_name_map, &mut diagnostics);
-
-    let mut files = vec![
-        GeneratedFile {
-            path: "Cargo.toml",
-            content: generate_cargo_toml(config, needs_regex, needs_uuid),
-        },
-        GeneratedFile {
-            path: "src/lib.rs",
-            content: generate_lib_rs(needs_defaults),
-        },
-        GeneratedFile {
-            path: "src/validation.rs",
-            content: write_validation_rs(entities, needs_regex)?,
-        },
-        GeneratedFile {
-            path: "src/model.rs",
-            content: write_model_rs(entities, &enum_name_map, &default_literals)?,
-        },
-    ];
-
-    if needs_defaults {
-        files.push(GeneratedFile {
-            path: "src/default.rs",
-            content: write_default_rs(entities, &enum_name_map, &default_literals)?,
-        });
-    }
-
-    Ok(GeneratedCrate { files, diagnostics })
-}
-
-fn header_comment() -> &'static str {
-    "This file is @generated — do not edit manually."
-}
 
 /// Collect deduplicated inline enum names from struct entities.
 ///
 /// Returns a map from `(entity_name, raw_enum_name)` → resolved prefixed name,
 /// plus a vec of `(resolved_name, &EnumDef)` for the unique enums to emit.
-type EnumNameMap = std::collections::HashMap<(String, String), String>;
+pub(crate) type EnumNameMap = std::collections::HashMap<(String, String), String>;
 
 /// Rendered default-value literals keyed by `(struct name, field name)`.
 /// A missing key means the field has no default, or its default could not be
 /// rendered (reported once by [`compute_default_literals`]).
-type DefaultLiterals = std::collections::HashMap<(String, String), String>;
+pub(crate) type DefaultLiterals = std::collections::HashMap<(String, String), String>;
 
 /// Render the Rust literal for every field default up front. Fields whose
 /// default cannot be represented are omitted and reported once as a Degraded
 /// diagnostic — the single source for both `model.rs` (whether to emit
 /// `#[serde(default)]`) and `default.rs` (the function body).
-fn compute_default_literals(
+pub(crate) fn compute_default_literals(
     entities: &[Entity],
     enum_name_map: &EnumNameMap,
     diagnostics: &mut Vec<Diagnostic>,
@@ -132,7 +57,7 @@ fn compute_default_literals(
     literals
 }
 
-fn resolve_inline_enums(entities: &[Entity]) -> (EnumNameMap, Vec<(String, &EnumDef)>) {
+pub(crate) fn resolve_inline_enums(entities: &[Entity]) -> (EnumNameMap, Vec<(String, &EnumDef)>) {
     let mut enum_name_map: EnumNameMap = EnumNameMap::new();
     let mut final_enums: Vec<(String, &EnumDef)> = Vec::new();
     let mut variants_to_name: std::collections::HashMap<Vec<String>, String> =
@@ -193,7 +118,7 @@ fn write_union(out: &mut String, union_def: &UnionDef) -> std::fmt::Result {
     writeln!(out, "}}")
 }
 
-fn write_model_rs(
+pub(crate) fn model_rs(
     entities: &[Entity],
     enum_name_map: &EnumNameMap,
     default_literals: &DefaultLiterals,
@@ -366,10 +291,10 @@ fn find_enum_variant_for_default(
     // Convert the default value to PascalCase to match the variant name.
     // This works because enum variants are generated as to_pascal_case(original_value)
     // and the original_value is what appears in the OpenAPI default.
-    Some(crate::parse::to_pascal_case(default_str))
+    Some(to_pascal_case(default_str))
 }
 
-fn write_default_rs(
+pub(crate) fn default_rs(
     entities: &[Entity],
     enum_name_map: &EnumNameMap,
     default_literals: &DefaultLiterals,
@@ -457,7 +382,10 @@ fn write_default_rs(
     Ok(out)
 }
 
-fn write_validation_rs(entities: &[Entity], needs_regex: bool) -> Result<String, std::fmt::Error> {
+pub(crate) fn validation_rs(
+    entities: &[Entity],
+    needs_regex: bool,
+) -> Result<String, std::fmt::Error> {
     let regex_import = if needs_regex {
         "use regex::Regex;\n"
     } else {
@@ -1021,104 +949,14 @@ fn write_field_checks(out: &mut String, field: &Field) -> std::fmt::Result {
     Ok(())
 }
 
-fn generate_cargo_toml(config: &Config, needs_regex: bool, needs_uuid: bool) -> String {
-    let header = header_comment();
-    if config.use_workspace {
-        let regex_dep = if needs_regex {
-            "regex.workspace = true\n"
-        } else {
-            ""
-        };
-        let uuid_dep = if needs_uuid {
-            "uuid = { workspace = true, features = [\"serde\"] }\n"
-        } else {
-            ""
-        };
-        format!(
-            "\
-# {header}
-
-[package]
-name = \"{crate_name}\"
-version = \"0.1.0\"
-edition = \"2024\"
-
-[dependencies]
-chrono = {{ workspace = true, features = [\"serde\"] }}
-{regex_dep}serde = {{ workspace = true, features = [\"derive\"] }}
-serde_json.workspace = true
-{uuid_dep}
-[dev-dependencies]
-pretty_assertions.workspace = true
-",
-            crate_name = config.crate_name,
-        )
-    } else {
-        let regex_dep = if needs_regex { "regex = \"1\"\n" } else { "" };
-        let uuid_dep = if needs_uuid {
-            "uuid = { version = \"1\", features = [\"serde\"] }\n"
-        } else {
-            ""
-        };
-        format!(
-            "\
-# {header}
-
-[package]
-name = \"{crate_name}\"
-version = \"0.1.0\"
-edition = \"2024\"
-
-[dependencies]
-chrono = {{ version = \"0.4\", features = [\"serde\"] }}
-{regex_dep}serde = {{ version = \"1\", features = [\"derive\"] }}
-serde_json = \"1\"
-{uuid_dep}
-[dev-dependencies]
-pretty_assertions = \"1\"
-",
-            crate_name = config.crate_name,
-        )
-    }
-}
-
-fn generate_lib_rs(needs_defaults: bool) -> String {
-    let header = header_comment();
-    let default_mod = if needs_defaults { "mod default;\n" } else { "" };
-    format!(
-        "\
-// {header}
-
-{default_mod}mod model;
-mod validation;
-
-pub use model::*;
-pub use validation::{{Validation, ValidationError}};
-"
-    )
-}
-
-/// Escape a name with `r#` if it is a Rust keyword.
-fn escape_keyword(name: &str) -> String {
-    if RUST_KEYWORDS.contains(&name) {
-        format!("r#{name}")
-    } else {
-        name.to_string()
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::{Config, Constraints, EntityKind, Field, StructDef};
+    use crate::{Config, Constraints, Entity, EntityKind, Field, GeneratedCrate, StructDef};
 
     type Result = std::result::Result<(), Box<dyn std::error::Error>>;
 
     fn test_config() -> Config {
-        Config {
-            crate_name: "test_api".to_string(),
-            use_workspace: true,
-        }
+        Config::new("test_api".to_string(), true)
     }
 
     fn find_file<'a>(krate: &'a GeneratedCrate, path: &str) -> &'a str {
@@ -1165,7 +1003,7 @@ mod tests {
                 },
             ),
         );
-        let krate = write(&[entity], &test_config())?;
+        let krate = crate::assemble(&[entity], &[], &test_config())?;
         let v = find_file(&krate, "src/validation.rs");
         assert!(v.contains("Regex::new("), "missing Regex::new: {v}");
         assert!(v.contains("use regex::Regex;"), "missing regex import: {v}");
@@ -1197,7 +1035,7 @@ mod tests {
                 },
             ),
         );
-        let krate = write(&[entity], &test_config())?;
+        let krate = crate::assemble(&[entity], &[], &test_config())?;
         let v = find_file(&krate, "src/validation.rs");
 
         // Regex::new argument keeps the un-doubled braces (a valid regex).
@@ -1232,7 +1070,7 @@ mod tests {
                 default_value: None,
             },
         );
-        let krate = write(&[entity], &test_config())?;
+        let krate = crate::assemble(&[entity], &[], &test_config())?;
         let v = find_file(&krate, "src/validation.rs");
         assert!(
             v.contains("if let Some(val) = &self.nickname"),

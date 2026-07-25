@@ -1,0 +1,10 @@
+[package]
+name = "notes-server"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+axum = "0.8"
+notes-openapi = { path = "../notes-openapi", features = ["server-axum"] }
+serde.workspace = true
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
