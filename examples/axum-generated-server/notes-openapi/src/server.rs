@@ -34,6 +34,7 @@ mod axum_impl {
     use crate::Validation;
     use axum::{
         Router,
+        http::StatusCode,
         extract::{FromRequestParts, State, Path, Query, Json},
         response::IntoResponse,
         routing::{get},
@@ -58,7 +59,7 @@ mod axum_impl {
         State(state): State<A::State>,
         ctx: A::Ctx,
         Query(query): Query<crate::ListNotesQuery>,
-    ) -> Result<Json<Vec<crate::Note>>, A::Error>
+    ) -> Result<(StatusCode, Json<Vec<crate::Note>>), A::Error>
     where
         A: Api + 'static,
         A::Error: IntoResponse,
@@ -66,14 +67,14 @@ mod axum_impl {
     {
         query.validate()?;
         let __resp = A::list_notes(state, ctx, query).await?;
-        Ok(Json(__resp))
+        Ok((StatusCode::OK, Json(__resp)))
     }
     async fn handle_create_note<A>(
         State(state): State<A::State>,
         ctx: A::Ctx,
         auth: A::Auth,
         Json(body): Json<crate::NewNote>,
-    ) -> Result<Json<crate::Note>, A::Error>
+    ) -> Result<(StatusCode, Json<crate::Note>), A::Error>
     where
         A: Api + 'static,
         A::Error: IntoResponse,
@@ -82,20 +83,20 @@ mod axum_impl {
     {
         body.validate()?;
         let __resp = A::create_note(state, ctx, auth, body).await?;
-        Ok(Json(__resp))
+        Ok((StatusCode::CREATED, Json(__resp)))
     }
     async fn handle_get_note<A>(
         State(state): State<A::State>,
         ctx: A::Ctx,
         Path(id): Path<String>,
-    ) -> Result<Json<crate::Note>, A::Error>
+    ) -> Result<(StatusCode, Json<crate::Note>), A::Error>
     where
         A: Api + 'static,
         A::Error: IntoResponse,
         A::Ctx: FromRequestParts<A::State> + 'static,
     {
         let __resp = A::get_note(state, ctx, id).await?;
-        Ok(Json(__resp))
+        Ok((StatusCode::OK, Json(__resp)))
     }
 }
 

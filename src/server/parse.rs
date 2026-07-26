@@ -88,7 +88,8 @@ fn build_route(
         ReferenceOr::Reference { .. } => None,
     });
 
-    let (response_type, response_array) = match success_response_type(&op.responses) {
+    let (success_status, response) = success_response(&op.responses);
+    let (response_type, response_array) = match response {
         Some((name, is_array)) => (Some(name), is_array),
         None => (None, false),
     };
@@ -102,6 +103,7 @@ fn build_route(
         body_type,
         response_type,
         response_array,
+        success_status,
         server_style,
         secured,
     }
@@ -142,18 +144,34 @@ fn query_struct_name(
     })
 }
 
-/// The success (200/201) response type, if it is a JSON `$ref` or an array of
-/// `$ref`. Returns `(schema_name, is_array)`.
-fn success_response_type(responses: &openapiv3::Responses) -> Option<(String, bool)> {
-    for code in [200u16, 201] {
-        if let Some(ReferenceOr::Item(resp)) =
-            responses.responses.get(&openapiv3::StatusCode::Code(code))
-            && let Some(ty) = response_schema_type(resp.content.get("application/json"))
-        {
-            return Some(ty);
+/// The operation's success (2xx) response: its HTTP status code and, when the
+/// JSON body is a `$ref` (or array of `$ref`), the body type.
+///
+/// Prefers a 2xx response that carries a representable JSON body; otherwise the
+/// first declared 2xx (e.g. a `204` empty response). Falls back to `200` / no
+/// body when the operation declares no 2xx response. The status code is honored
+/// by the axum adapter so `201`/`204` no longer regress to `200`.
+fn success_response(responses: &openapiv3::Responses) -> (u16, Option<(String, bool)>) {
+    let mut chosen: Option<(u16, Option<(String, bool)>)> = None;
+    for (code, resp_ref) in &responses.responses {
+        let openapiv3::StatusCode::Code(code) = code else {
+            continue;
+        };
+        if !(200..300).contains(code) {
+            continue;
+        }
+        let body = match resp_ref {
+            ReferenceOr::Item(resp) => response_schema_type(resp.content.get("application/json")),
+            ReferenceOr::Reference { .. } => None,
+        };
+        match &chosen {
+            // Keep the first 2xx seen, but upgrade to one that carries a body.
+            None => chosen = Some((*code, body)),
+            Some((_, None)) if body.is_some() => chosen = Some((*code, body)),
+            _ => {}
         }
     }
-    None
+    chosen.unwrap_or((200, None))
 }
 
 /// Resolve a response media type to `(schema_name, is_array)`. A direct `$ref`

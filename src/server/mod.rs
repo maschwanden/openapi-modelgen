@@ -32,6 +32,9 @@ pub struct Route {
     pub response_type: Option<String>,
     /// Whether the success response is a `Vec` of `response_type` (array schema).
     pub response_array: bool,
+    /// The success HTTP status code declared in the spec (e.g. `201`, `204`).
+    /// Emitted by the axum adapter so the response is not always `200`.
+    pub success_status: u16,
     /// How this operation is served: in the generated trait (`Strict`) or
     /// hand-wired by the user (`Manual`, excluded from generated code).
     pub server_style: ServerStyle,
@@ -191,6 +194,7 @@ mod tests {
             body_type: None,
             response_type: None,
             response_array: false,
+            success_status: 200,
             server_style: ServerStyle::Strict,
             secured: false,
         }

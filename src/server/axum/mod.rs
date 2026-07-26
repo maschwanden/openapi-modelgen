@@ -52,6 +52,9 @@ pub(crate) fn write_axum_module(
     }
     writeln!(out, "    use axum::{{")?;
     writeln!(out, "        Router,")?;
+    if !routes.is_empty() {
+        writeln!(out, "        http::StatusCode,")?;
+    }
     writeln!(out, "        extract::{{{}}},", extractors.join(", "))?;
     writeln!(out, "        response::IntoResponse,")?;
     writeln!(out, "        routing::{{{}}},", methods.join(", "))?;
@@ -124,12 +127,29 @@ fn route_registration_lines(routes: &[&Route]) -> Vec<String> {
         .collect()
 }
 
-/// Emit the private axum handler wrapper: extract → validate → call → wrap.
+/// The `axum::http::StatusCode` expression for a success status code. Common
+/// codes use the named constant; anything else falls back to `from_u16`.
+fn status_code_expr(code: u16) -> String {
+    match code {
+        200 => "StatusCode::OK".to_string(),
+        201 => "StatusCode::CREATED".to_string(),
+        202 => "StatusCode::ACCEPTED".to_string(),
+        204 => "StatusCode::NO_CONTENT".to_string(),
+        other => format!("StatusCode::from_u16({other}).unwrap()"),
+    }
+}
+
+/// Emit the private axum handler wrapper: extract → validate → call → wrap with
+/// the spec's success status code.
 fn write_handler_fn(out: &mut String, route: &Route) -> std::fmt::Result {
     let call = escape_keyword(&route.handler);
+    let status = status_code_expr(route.success_status);
     let (ret_ty, wrap_call) = match &route.response_type {
-        Some(_) => (format!("Json<{}>", super::route_response_type(route)), true),
-        None => ("()".to_string(), false),
+        Some(_) => (
+            format!("(StatusCode, Json<{}>)", super::route_response_type(route)),
+            true,
+        ),
+        None => ("StatusCode".to_string(), false),
     };
 
     writeln!(
@@ -200,10 +220,10 @@ fn write_handler_fn(out: &mut String, route: &Route) -> std::fmt::Result {
 
     if wrap_call {
         writeln!(out, "        let __resp = A::{call}({args}).await?;")?;
-        writeln!(out, "        Ok(Json(__resp))")?;
+        writeln!(out, "        Ok(({status}, Json(__resp)))")?;
     } else {
         writeln!(out, "        A::{call}({args}).await?;")?;
-        writeln!(out, "        Ok(())")?;
+        writeln!(out, "        Ok({status})")?;
     }
     writeln!(out, "    }}")?;
     Ok(())
@@ -241,9 +261,43 @@ mod tests {
             body_type: None,
             response_type: None,
             response_array: false,
+            success_status: 200,
             server_style: ServerStyle::Strict,
             secured: false,
         }
+    }
+
+    #[test]
+    fn handler_honors_success_status_codes() -> Result {
+        let routes = vec![
+            // 201 Created, with a body.
+            Route {
+                body_type: Some("Thing".into()),
+                response_type: Some("Thing".into()),
+                success_status: 201,
+                ..base("post", "/things", "create_thing")
+            },
+            // 204 No Content, no body.
+            Route {
+                success_status: 204,
+                ..base("delete", "/things/{id}", "delete_thing")
+            },
+        ];
+        let krate = crate::assemble(&[], &routes, &server_config())?;
+        let server = find_file(&krate, "src/server.rs");
+        assert!(
+            server.contains("Ok((StatusCode::CREATED, Json(__resp)))"),
+            "201 body response should carry CREATED: {server}"
+        );
+        assert!(
+            server.contains("-> Result<(StatusCode, Json<crate::Thing>), A::Error>"),
+            "body handler should return (StatusCode, Json<..>): {server}"
+        );
+        assert!(
+            server.contains("Ok(StatusCode::NO_CONTENT)"),
+            "204 empty response should return NO_CONTENT: {server}"
+        );
+        Ok(())
     }
 
     #[test]
