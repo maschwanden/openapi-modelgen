@@ -35,10 +35,11 @@ mod axum_impl {
     use axum::{
         Router,
         http::StatusCode,
-        extract::{FromRequestParts, State, Path, Query, Json},
+        extract::{FromRequestParts, State, Path, Json},
         response::IntoResponse,
         routing::{get},
     };
+    use axum_extra::extract::Query;
 
     /// Wire every generated route into an `axum::Router`. Add any manual
     /// routes, then apply your state LAST:

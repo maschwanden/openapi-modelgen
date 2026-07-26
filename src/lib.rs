@@ -149,6 +149,9 @@ pub(crate) fn assemble(
 
     let (enum_name_map, _) = model::write::resolve_inline_enums(entities);
 
+    // The axum adapter needs `axum-extra` only when it emits a query extractor.
+    let needs_axum_query = config.emit_axum && routes.iter().any(|r| r.query_type.is_some());
+
     let mut diagnostics = Vec::new();
     // Render every field default once; both model.rs and default.rs consume the
     // result, and unrenderable defaults are reported here (a single site).
@@ -158,7 +161,12 @@ pub(crate) fn assemble(
     let mut files = vec![
         GeneratedFile {
             path: "Cargo.toml",
-            content: manifest::generate_cargo_toml(config, needs_regex, needs_uuid),
+            content: manifest::generate_cargo_toml(
+                config,
+                needs_regex,
+                needs_uuid,
+                needs_axum_query,
+            ),
         },
         GeneratedFile {
             path: "src/lib.rs",

@@ -33,12 +33,10 @@ pub(crate) fn write_axum_module(
     methods.sort_unstable();
     methods.dedup();
 
+    // `Query` comes from `axum-extra` (repeated keys → `Vec`), not `axum`.
     let mut extractors = vec!["FromRequestParts", "State"];
     if needs_path {
         extractors.push("Path");
-    }
-    if needs_query {
-        extractors.push("Query");
     }
     if needs_json {
         extractors.push("Json");
@@ -59,6 +57,9 @@ pub(crate) fn write_axum_module(
     writeln!(out, "        response::IntoResponse,")?;
     writeln!(out, "        routing::{{{}}},", methods.join(", "))?;
     writeln!(out, "    }};")?;
+    if needs_query {
+        writeln!(out, "    use axum_extra::extract::Query;")?;
+    }
     writeln!(out)?;
 
     // The free `router` fn wiring every generated route into an axum::Router.
@@ -338,6 +339,17 @@ mod tests {
         assert!(
             server.contains("query.validate()?;") && server.contains("body.validate()?;"),
             "handlers should validate: {server}"
+        );
+        // Query extraction uses axum-extra so repeated keys collect into `Vec`.
+        assert!(
+            server.contains("use axum_extra::extract::Query;"),
+            "query extractor should come from axum-extra: {server}"
+        );
+        let cargo = find_file(&krate, "Cargo.toml");
+        assert!(
+            cargo.contains("axum-extra = { version = \"0.10\", features = [\"query\"]")
+                && cargo.contains("\"dep:axum-extra\""),
+            "Cargo.toml should depend on axum-extra + gate it behind server-axum: {cargo}"
         );
         // `router` takes no state and returns `Router<A::State>`; the caller
         // applies `.with_state` after merging manual routes (so those manual

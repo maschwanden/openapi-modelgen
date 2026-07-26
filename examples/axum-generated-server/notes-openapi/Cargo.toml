@@ -11,6 +11,7 @@ serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 axum = { version = "0.8", optional = true }
 tokio = { version = "1", features = ["full"], optional = true }
+axum-extra = { version = "0.10", features = ["query"], optional = true }
 
 [dev-dependencies]
 pretty_assertions.workspace = true
@@ -19,4 +20,4 @@ pretty_assertions.workspace = true
 # Enables the framework-agnostic `Api` trait in `server.rs`.
 server = []
 # Enables the axum adapter (`server::router`).
-server-axum = ["dep:axum", "dep:tokio", "server"]
+server-axum = ["dep:axum", "dep:tokio", "dep:axum-extra", "server"]

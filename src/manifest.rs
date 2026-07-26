@@ -4,15 +4,29 @@
 use crate::Config;
 use crate::common::header_comment;
 
-pub(crate) fn generate_cargo_toml(config: &Config, needs_regex: bool, needs_uuid: bool) -> String {
+pub(crate) fn generate_cargo_toml(
+    config: &Config,
+    needs_regex: bool,
+    needs_uuid: bool,
+    needs_axum_query: bool,
+) -> String {
     let header = header_comment();
     // Server deps use fixed versions in both modes: a consuming workspace is
     // unlikely to pin axum/tokio, and these are opt-in extras anyway.
-    let server_deps = if config.emit_axum {
-        "axum = { version = \"0.8\", optional = true }\n\
-         tokio = { version = \"1\", features = [\"full\"], optional = true }\n"
-    } else {
-        ""
+    // `axum-extra` provides the query extractor that collects repeated keys
+    // (`?k=a&k=b`) into `Vec`, which plain `axum::extract::Query` cannot.
+    let server_deps = {
+        let mut s = String::new();
+        if config.emit_axum {
+            s.push_str("axum = { version = \"0.8\", optional = true }\n");
+            s.push_str("tokio = { version = \"1\", features = [\"full\"], optional = true }\n");
+            if needs_axum_query {
+                s.push_str(
+                    "axum-extra = { version = \"0.10\", features = [\"query\"], optional = true }\n",
+                );
+            }
+        }
+        s
     };
     let server_features = {
         let mut s = String::new();
@@ -25,10 +39,15 @@ pub(crate) fn generate_cargo_toml(config: &Config, needs_regex: bool, needs_uuid
             );
         }
         if config.emit_axum {
-            s.push_str(
+            let extra_dep = if needs_axum_query {
+                ", \"dep:axum-extra\""
+            } else {
+                ""
+            };
+            s.push_str(&format!(
                 "# Enables the axum adapter (`server::router`).\n\
-                 server-axum = [\"dep:axum\", \"dep:tokio\", \"server\"]\n",
-            );
+                 server-axum = [\"dep:axum\", \"dep:tokio\"{extra_dep}, \"server\"]\n"
+            ));
         }
         s
     };
