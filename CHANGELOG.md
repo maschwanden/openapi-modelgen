@@ -4,6 +4,23 @@ This document describes notable changes to `openapi-modelgen`, the tool that
 generates a self-contained Rust crate (models, runtime validation, and an
 optional server layer) from an OpenAPI 3.0 spec.
 
+## v0.1.12 (2026-07-26)
+
+### Added
+
+- Top-level `type: array` schemas are now generated as a type alias
+  (`pub type TagArray = Vec<Tag>;`) instead of being dropped, reusing the
+  referenced item type. Server operations that `$ref` such a schema get a typed
+  response.
+
+### Fixed
+
+- The "inline body not generated as a named type" diagnostic now inspects only
+  the `application/json` content. A response whose JSON body is a `$ref` but
+  that also offers a non-JSON alternate (`text/csv`, `text/html`) is no longer
+  falsely reported as an ungenerated body — so `--strict` is not blocked by CSV
+  export endpoints whose JSON is already a named schema.
+
 ## v0.1.11 (2026-07-26)
 
 ### Fixed
