@@ -4,6 +4,29 @@ This document describes notable changes to `openapi-modelgen`, the tool that
 generates a self-contained Rust crate (models, runtime validation, and an
 optional server layer) from an OpenAPI 3.0 spec.
 
+## v0.1.11 (2026-07-26)
+
+### Fixed
+
+- Server generation: honor the operation's declared success status code — a
+  `201 Created` or `204 No Content` response is emitted instead of always
+  returning `200`.
+- Server generation: type path parameters from the spec (`integer/int64` →
+  `i64`, `int32` → `i32`, `number` → `f64`, `boolean` → `bool`) instead of
+  always `String`. This changes the generated `Api` trait method signatures, so
+  existing implementations must adopt the typed parameter.
+- Server generation: extract query parameters via `axum-extra`, so repeated
+  keys (`?k=a&k=b`) collect into a `Vec` instead of collapsing to a single
+  value. The generated `Cargo.toml` gains an `axum-extra` dependency (behind the
+  `server-axum` feature) when a query extractor is emitted.
+- Server generation: derive unique, valid handler and query-struct names from
+  the path when an operation has no `operationId`. Sibling paths like `/things`
+  and `/things/{id}` no longer collide into the same trait method, and segments
+  with characters such as `.` (e.g. `/spec/openapi.yaml`) no longer produce
+  invalid Rust identifiers. Names that still collide (e.g. duplicate
+  operationIds) are reported as a diagnostic instead of silently emitting a
+  crate that will not compile.
+
 ## v0.1.10 (2026-07-26)
 
 ### Added
