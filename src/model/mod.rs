@@ -34,6 +34,18 @@ pub enum Entity {
     Enum(EnumDef),
     /// A tagged/untagged union generated from a top-level `oneOf` schema.
     Union(UnionDef),
+    /// A type alias generated from a schema whose root is an array,
+    /// e.g. `pub type TagArray = Vec<Tag>;`.
+    Alias(AliasDef),
+}
+
+/// A top-level type alias generated from an array schema.
+#[derive(Debug, PartialEq)]
+pub struct AliasDef {
+    /// Alias name in PascalCase (e.g. `TagArray`).
+    pub name: String,
+    /// The aliased Rust type (e.g. `Vec<Tag>`).
+    pub rust_type: String,
 }
 
 #[derive(Debug, PartialEq)]

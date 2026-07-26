@@ -3,7 +3,9 @@ use openapiv3::{
     VariantOrUnknownOrEmpty,
 };
 
-use super::{Constraints, Entity, EntityKind, EnumDef, Field, StructDef, UnionDef, UnionVariant};
+use super::{
+    AliasDef, Constraints, Entity, EntityKind, EnumDef, Field, StructDef, UnionDef, UnionVariant,
+};
 use crate::common::{
     parameter_data, query_name_from_path, resolve_parameter_ref, resolve_ref_name, to_pascal_case,
 };
@@ -52,6 +54,7 @@ pub fn parse_with_diagnostics(spec: &OpenAPI, diagnostics: &mut Vec<Diagnostic>)
 
             let entity = parse_schema(name, schema, diagnostics)
                 .or_else(|| parse_one_of(name, schema, diagnostics))
+                .or_else(|| parse_array_alias(name, schema, diagnostics))
                 .or_else(|| parse_enum(name, schema).map(Entity::Enum));
 
             match entity {
@@ -139,26 +142,56 @@ fn diagnose_unsupported_schema(name: &str, schema: &Schema, diagnostics: &mut Ve
             "boolean schema",
             "top-level boolean type alias is not generated as a distinct type",
         ),
-        SchemaKind::Type(Type::Array(_)) => (
-            "array schema",
-            "top-level array type alias is not generated as a distinct type",
-        ),
-        // Objects are always handled by `parse_schema`; nothing to report.
-        SchemaKind::Type(Type::Object(_)) => return,
+        // Arrays are handled by `parse_array_alias`; objects by `parse_schema`.
+        SchemaKind::Type(Type::Array(_) | Type::Object(_)) => return,
     };
     record(diagnostics, Severity::Dropped, path, construct, reason);
 }
 
+/// Parse a top-level `type: array` schema into a type alias
+/// (`pub type Name = Vec<Item>;`). The item type is resolved the same way as an
+/// array field, so `$ref` items become the referenced type.
+fn parse_array_alias(
+    name: &str,
+    schema: &Schema,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Option<Entity> {
+    let SchemaKind::Type(Type::Array(arr)) = &schema.schema_kind else {
+        return None;
+    };
+    let context = format!("components.schemas.{name}");
+    let inner = match &arr.items {
+        Some(items) => resolve_field_type(items, &context, diagnostics).0,
+        None => {
+            record(
+                diagnostics,
+                Severity::Degraded,
+                context,
+                "array without items",
+                "array has no `items` schema; element type is `serde_json::Value`",
+            );
+            "serde_json::Value".to_string()
+        }
+    };
+    Some(Entity::Alias(AliasDef {
+        name: name.to_string(),
+        rust_type: format!("Vec<{inner}>"),
+    }))
+}
+
 /// Whether any media type in a body carries an *inline* schema.
 ///
-/// A `$ref` content schema resolves to a component we generate, so it is not a
-/// loss; only an inline schema (`ReferenceOr::Item`) has no generated type.
-fn content_has_inline_schema<'a>(
-    content: impl IntoIterator<Item = &'a openapiv3::MediaType>,
-) -> bool {
-    content
-        .into_iter()
-        .any(|media| matches!(media.schema, Some(ReferenceOr::Item(_))))
+/// Whether a body's `application/json` schema is *inline* (no generated type).
+///
+/// Only the JSON media type is considered: a `$ref` resolves to a component we
+/// generate (not a loss), and non-JSON content types (`text/csv`, `text/html`,
+/// …) — typically `type: string` byte streams — are never turned into model
+/// types, so they must not be reported as an ungenerated body.
+fn json_body_is_inline(json: Option<&openapiv3::MediaType>) -> bool {
+    matches!(
+        json.and_then(|media| media.schema.as_ref()),
+        Some(ReferenceOr::Item(_))
+    )
 }
 
 /// Record diagnostics for operation request/response bodies, which are never
@@ -197,7 +230,7 @@ fn diagnose_operation_bodies(
             }
         };
         if let Some(body) = resolved
-            && content_has_inline_schema(body.content.values())
+            && json_body_is_inline(body.content.get("application/json"))
         {
             record(
                 diagnostics,
@@ -214,12 +247,13 @@ fn diagnose_operation_bodies(
     for response_ref in op.responses.responses.values().chain(&op.responses.default) {
         match response_ref {
             ReferenceOr::Item(response) => {
-                response_has_inline_schema |= content_has_inline_schema(response.content.values());
+                response_has_inline_schema |=
+                    json_body_is_inline(response.content.get("application/json"));
             }
             ReferenceOr::Reference { reference } => match resolve_response(reference, components) {
                 Some(response) => {
                     response_has_inline_schema |=
-                        content_has_inline_schema(response.content.values());
+                        json_body_is_inline(response.content.get("application/json"));
                 }
                 None => record(
                     diagnostics,
@@ -1498,6 +1532,44 @@ components:
 "##
         ))?;
         assert!(diags.is_empty(), "expected no diagnostics, got {diags:?}");
+
+        Ok(())
+    }
+
+    /// A response whose JSON body is a `$ref` but that also offers a non-JSON
+    /// alternate (`text/csv`, a plain `type: string` blob) is clean — the CSV
+    /// body is never a generated type, so it must not be flagged.
+    #[test]
+    fn diagnostic_non_json_response_body_is_clean() -> Result<()> {
+        let diags = diagnostics_for(&format!(
+            r##"{MINIMAL_HEADER}
+paths:
+  /export:
+    get:
+      operationId: exportThings
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Base'
+            text/csv:
+              schema:
+                type: string
+components:
+  schemas:
+    Base:
+      type: object
+      properties:
+        id:
+          type: string
+"##
+        ))?;
+        assert!(
+            !has_construct(&diags, "response body"),
+            "a text/csv alternate must not be flagged when JSON is a $ref: {diags:?}"
+        );
 
         Ok(())
     }

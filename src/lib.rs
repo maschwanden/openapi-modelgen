@@ -23,7 +23,7 @@ pub use diagnostics::{Diagnostic, Severity};
 pub use error::Result;
 pub use model::parse::{parse, parse_with_diagnostics};
 pub use model::{
-    Constraints, Entity, EntityKind, EnumDef, Field, StructDef, UnionDef, UnionVariant,
+    AliasDef, Constraints, Entity, EntityKind, EnumDef, Field, StructDef, UnionDef, UnionVariant,
 };
 pub use server::Route;
 
@@ -124,7 +124,7 @@ pub(crate) fn assemble(
 ) -> std::result::Result<GeneratedCrate, std::fmt::Error> {
     let struct_fields = entities.iter().filter_map(|e| match e {
         Entity::Struct(s) => Some(s.fields.as_slice()),
-        Entity::Enum(_) | Entity::Union(_) => None,
+        Entity::Enum(_) | Entity::Union(_) | Entity::Alias(_) => None,
     });
 
     let needs_regex = struct_fields.clone().any(|fields| {
@@ -338,6 +338,43 @@ pub use validation::{Validation, ValidationError};
 "
         );
 
+        Ok(())
+    }
+
+    /// A top-level `type: array` schema becomes a `pub type X = Vec<Item>;`
+    /// alias (no longer dropped), reusing the referenced item type.
+    #[test]
+    fn top_level_array_alias() -> Result<()> {
+        let yaml = r##"
+openapi: "3.0.3"
+info:
+  title: Test
+  version: "0.1.0"
+paths: {}
+components:
+  schemas:
+    Tag:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+    TagArray:
+      type: array
+      items:
+        $ref: "#/components/schemas/Tag"
+"##;
+        let crate_ = generate(&load_spec(yaml)?, &test_config())?;
+        let model = file_content(&crate_, "src/model.rs");
+        assert!(
+            model.contains("pub type TagArray = Vec<Tag>;"),
+            "missing array alias: {model}"
+        );
+        assert!(
+            crate_.diagnostics.is_empty(),
+            "array schema should no longer be dropped: {:?}",
+            crate_.diagnostics
+        );
         Ok(())
     }
 

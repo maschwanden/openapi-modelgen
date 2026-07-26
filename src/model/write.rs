@@ -125,12 +125,19 @@ pub(crate) fn model_rs(
 ) -> Result<String, std::fmt::Error> {
     let struct_fields = entities.iter().filter_map(|e| match e {
         Entity::Struct(s) => Some(&s.fields),
-        Entity::Enum(_) | Entity::Union(_) => None,
+        Entity::Enum(_) | Entity::Union(_) | Entity::Alias(_) => None,
     });
+    let alias_types = || {
+        entities.iter().filter_map(|e| match e {
+            Entity::Alias(a) => Some(a.rust_type.as_str()),
+            _ => None,
+        })
+    };
     let has_type = |ty: &str| {
         struct_fields
             .clone()
             .any(|fields| fields.iter().any(|f| f.rust_type.contains(ty)))
+            || alias_types().any(|t| t.contains(ty))
     };
 
     let needs_datetime = has_type("DateTime");
@@ -212,6 +219,15 @@ use serde::{{Deserialize, Serialize}};{uuid_import}
             )?;
         }
         writeln!(out, "}}")?;
+    }
+
+    // Emit type aliases (from top-level array schemas). `Vec<T>` already has a
+    // blanket `Validation` impl, so no separate validation is generated.
+    for entity in entities {
+        if let Entity::Alias(alias) = entity {
+            writeln!(out)?;
+            writeln!(out, "pub type {} = {};", alias.name, alias.rust_type)?;
+        }
     }
 
     Ok(out)
@@ -301,7 +317,7 @@ pub(crate) fn default_rs(
 ) -> Result<String, std::fmt::Error> {
     let struct_fields_with_name = entities.iter().filter_map(|e| match e {
         Entity::Struct(s) => Some((&s.name, &s.fields)),
-        Entity::Enum(_) | Entity::Union(_) => None,
+        Entity::Enum(_) | Entity::Union(_) | Entity::Alias(_) => None,
     });
 
     // Determine which chrono/uuid imports are needed in default functions
@@ -447,6 +463,8 @@ impl<T: Validation> Validation for Vec<T> {{
                 writeln!(out, "impl Validation for {} {{}}", e.name)?;
             }
             Entity::Union(u) => write_union_validation_impl(&mut out, u)?,
+            // A `Vec<T>` alias is covered by the blanket `Validation for Vec<T>`.
+            Entity::Alias(_) => {}
         }
     }
 
