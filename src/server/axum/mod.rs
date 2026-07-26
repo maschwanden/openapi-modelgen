@@ -163,18 +163,27 @@ fn write_handler_fn(out: &mut String, route: &Route) -> std::fmt::Result {
         writeln!(out, "        auth: A::Auth,")?;
     }
 
-    // Path extractor (positional; all params are String in this prototype).
+    // Path extractor (positional), typed from the spec.
     let param_idents: Vec<String> = route
         .path_params
         .iter()
-        .map(|p| path_param_ident(p))
+        .map(|(name, _)| path_param_ident(name))
+        .collect();
+    let param_types: Vec<&str> = route
+        .path_params
+        .iter()
+        .map(|(_, ty)| ty.as_str())
         .collect();
     match param_idents.len() {
         0 => {}
-        1 => writeln!(out, "        Path({}): Path<String>,", param_idents[0])?,
+        1 => writeln!(
+            out,
+            "        Path({}): Path<{}>,",
+            param_idents[0], param_types[0]
+        )?,
         _ => {
             let tuple = param_idents.join(", ");
-            let types = vec!["String"; param_idents.len()].join(", ");
+            let types = param_types.join(", ");
             writeln!(out, "        Path(({tuple})): Path<({types})>,")?;
         }
     }

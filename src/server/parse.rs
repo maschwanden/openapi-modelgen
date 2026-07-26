@@ -1,4 +1,7 @@
-use openapiv3::{OpenAPI, Operation, ReferenceOr};
+use openapiv3::{
+    IntegerFormat, OpenAPI, Operation, ReferenceOr, Schema, SchemaKind, Type,
+    VariantOrUnknownOrEmpty,
+};
 
 use super::Route;
 use crate::common::{
@@ -98,7 +101,7 @@ fn build_route(
         method: method.to_string(),
         path: path.to_string(),
         handler,
-        path_params: path_param_names(path),
+        path_params: path_params(op, components, path),
         query_type: query_struct_name(op, components, method, path),
         body_type,
         response_type,
@@ -118,6 +121,71 @@ fn path_param_names(path: &str) -> Vec<String> {
                 .map(str::to_string)
         })
         .collect()
+}
+
+/// Path parameters as `(name, rust_type)` pairs, in URL order. The type is
+/// resolved from the operation's matching `in: path` parameter schema so the
+/// generated methods receive e.g. `i64` instead of `String`.
+fn path_params(
+    op: &Operation,
+    components: Option<&openapiv3::Components>,
+    path: &str,
+) -> Vec<(String, String)> {
+    path_param_names(path)
+        .into_iter()
+        .map(|name| {
+            let ty = path_param_type(op, components, &name).unwrap_or_else(|| "String".to_string());
+            (name, ty)
+        })
+        .collect()
+}
+
+/// Resolve the Rust type of a single `in: path` parameter by `name`, looking
+/// through `$ref` parameters. Returns `None` when the parameter or its schema
+/// is missing (caller falls back to `String`).
+fn path_param_type(
+    op: &Operation,
+    components: Option<&openapiv3::Components>,
+    name: &str,
+) -> Option<String> {
+    op.parameters.iter().find_map(|p| {
+        let param = match p {
+            ReferenceOr::Item(param) => Some(param),
+            ReferenceOr::Reference { reference } => resolve_parameter_ref(reference, components),
+        };
+        match param {
+            Some(openapiv3::Parameter::Path { parameter_data, .. })
+                if parameter_data.name == name =>
+            {
+                match &parameter_data.format {
+                    openapiv3::ParameterSchemaOrContent::Schema(schema) => {
+                        Some(scalar_param_type(schema))
+                    }
+                    openapiv3::ParameterSchemaOrContent::Content(_) => None,
+                }
+            }
+            _ => None,
+        }
+    })
+}
+
+/// Map a (required, non-nullable) path-parameter schema to a Rust scalar type.
+/// Only plain scalars are supported; anything else (incl. `uuid`/`date`
+/// formats and non-scalar shapes) falls back to `String`.
+fn scalar_param_type(schema_ref: &ReferenceOr<Schema>) -> String {
+    let ReferenceOr::Item(schema) = schema_ref else {
+        return "String".to_string();
+    };
+    match &schema.schema_kind {
+        SchemaKind::Type(Type::Integer(i)) => match i.format {
+            VariantOrUnknownOrEmpty::Item(IntegerFormat::Int32) => "i32",
+            _ => "i64",
+        }
+        .to_string(),
+        SchemaKind::Type(Type::Number(_)) => "f64".to_string(),
+        SchemaKind::Type(Type::Boolean(_)) => "bool".to_string(),
+        _ => "String".to_string(),
+    }
 }
 
 /// The generated query-struct name for an operation, if it has query params.
@@ -273,6 +341,21 @@ mod tests {
         let r = find(&routes, "get", "/things");
         assert_eq!(r.response_type.as_deref(), Some("Thing"));
         assert!(r.response_array, "array response should set response_array");
+        Ok(())
+    }
+
+    #[test]
+    fn path_param_type_from_spec() -> Result<()> {
+        let yaml = format!(
+            "{HEADER}paths:\n  /things/{{thing_id}}:\n    get:\n      operationId: getThing\n      parameters:\n        - name: thing_id\n          in: path\n          required: true\n          schema:\n            type: integer\n            format: int64\n      responses:\n        \"200\":\n          description: ok\n"
+        );
+        let spec = load_spec(&yaml)?;
+        let routes = parse_routes(&spec, &Config::new("x".into(), false));
+        let r = find(&routes, "get", "/things/{thing_id}");
+        assert_eq!(
+            r.path_params,
+            vec![("thing_id".to_string(), "i64".to_string())]
+        );
         Ok(())
     }
 }

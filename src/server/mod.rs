@@ -22,8 +22,9 @@ pub struct Route {
     pub path: String,
     /// snake_case handler name (from `operationId`, else derived from method+path).
     pub handler: String,
-    /// Path parameter names in URL order. All treated as `String` in this prototype.
-    pub path_params: Vec<String>,
+    /// Path parameters as `(name, rust_type)` in URL order, typed from the spec
+    /// (e.g. `("contact_id", "i64")`); non-scalar params fall back to `String`.
+    pub path_params: Vec<(String, String)>,
     /// Generated query-parameter struct name, if the operation has query params.
     pub query_type: Option<String>,
     /// Request-body struct name (a `$ref` schema), if a JSON body is present.
@@ -137,8 +138,8 @@ fn write_trait_method(out: &mut String, route: &Route) -> std::fmt::Result {
     if route.secured {
         write!(args, ", auth: Self::Auth")?;
     }
-    for p in &route.path_params {
-        write!(args, ", {}: String", path_param_ident(p))?;
+    for (name, ty) in &route.path_params {
+        write!(args, ", {}: {ty}", path_param_ident(name))?;
     }
     if let Some(q) = &route.query_type {
         write!(args, ", query: crate::{q}")?;
@@ -213,7 +214,7 @@ mod tests {
                 ..route("post", "/things", "create_thing")
             },
             Route {
-                path_params: vec!["id".into()],
+                path_params: vec![("id".into(), "i64".into())],
                 response_type: Some("Thing".into()),
                 ..route("get", "/things/{id}", "get_thing_by_id")
             },
@@ -240,8 +241,8 @@ mod tests {
             "list_things signature: {server}"
         );
         assert!(
-            server.contains("fn get_thing_by_id(state: Self::State, ctx: Self::Ctx, id: String)"),
-            "path-param signature: {server}"
+            server.contains("fn get_thing_by_id(state: Self::State, ctx: Self::Ctx, id: i64)"),
+            "path-param signature (typed): {server}"
         );
         // No security in this spec → no Auth machinery.
         assert!(!server.contains("type Auth"), "unexpected Auth: {server}");
