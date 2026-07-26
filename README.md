@@ -113,6 +113,54 @@ generated/
 | `--output-dir <DIR>` | Parent directory — the crate is written to `<DIR>/<crate-name>/` |
 | `--crate-name <NAME>` | Cargo package name for the generated crate (also used as the subdirectory name) |
 | `--workspace` | Use `foo.workspace = true` style dependency references instead of fixed versions |
+| `--server` | Also generate `src/server.rs` (an `Api` trait plus an axum adapter). Shorthand for enabling both server targets; see [Configuration file](#configuration-file) |
+| `--config <PATH>` | Path to an [`openapi-modelgen.yaml`](#configuration-file) config file selecting generation targets and server styles |
+| `--strict` | Exit non-zero if any part of the spec was **dropped** (produced no output). Degraded-only runs still succeed; files are always written. Lets CI gate on lossless generation |
+
+### Configuration file
+
+Model generation needs no configuration — the flags above are enough. To also
+generate a **server** layer, or to tune how individual operations are served,
+pass an optional YAML config with `--config`:
+
+```sh
+openapi-modelgen \
+  --input path/to/openapi.yaml \
+  --output-dir ./generated \
+  --crate-name my-api-models \
+  --config openapi-modelgen.yaml
+```
+
+A fully-annotated template lives at
+[`openapi-modelgen.example.yaml`](openapi-modelgen.example.yaml) — copy it as a
+starting point. All fields are optional; the values below are the defaults:
+
+```yaml
+# Which artifacts to generate.
+generate:
+  model: true         # model.rs / validation.rs (+ default.rs)
+  server: false       # the framework-agnostic `Api` trait in server.rs (requires model)
+  axum-server: false  # the axum adapter (implies, and requires, server)
+
+# Default for how each operation is served (only used when a server is generated):
+#   strict - a method on the generated `Api` trait (a missing impl is a compile error)
+#   manual - excluded from the trait; you wire it up by hand
+server-style: strict
+
+# Per-operation overrides, keyed by operationId.
+operations:
+  deleteThing:
+    server-style: manual
+```
+
+Notes:
+
+- The targets have a dependency rule: `axum-server` requires `server`, and
+  `server` requires `model`. Violations are reported as an error.
+- `--server` is a shorthand for `generate: { server: true, axum-server: true }`
+  and overrides the config file when both are given.
+- A working config is in
+  [`examples/axum-generated-server/openapi-modelgen.yaml`](examples/axum-generated-server/openapi-modelgen.yaml).
 
 ### Examples
 

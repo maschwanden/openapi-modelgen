@@ -1,0 +1,29 @@
+# Example openapi-modelgen configuration.
+#
+# A config file is only needed when you want to generate a server (or tune how
+# individual operations are served) — model generation needs no config. Copy
+# this file next to your OpenAPI spec, adjust it, and pass it with
+# `--config openapi-modelgen.yaml`. Every field is optional.
+
+# Which artifacts to generate.
+generate:
+  # Generate model.rs / validation.rs (+ default.rs). Default: true.
+  model: true
+  # Generate the framework-agnostic `Api` trait in server.rs. Default: false.
+  # Requires `model: true`.
+  server: true
+  # Generate the axum adapter inside server.rs. Default: false.
+  # Implies (and requires) `server: true`.
+  axum-server: true
+
+# Project-wide default for how each operation is served. Default: strict.
+#   strict - emit the operation as a method on the generated `Api` trait, so a
+#            missing implementation is a compile error.
+#   manual - exclude the operation from the trait; you wire it up by hand.
+server-style: strict
+
+# Per-operation overrides of `server-style`, keyed by `operationId`.
+operations:
+  # Serve `deleteThing` by hand instead of through the generated trait.
+  deleteThing:
+    server-style: manual
