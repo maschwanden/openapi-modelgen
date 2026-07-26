@@ -1026,7 +1026,7 @@ components:
         let Entity::Struct(s) = &entities[0] else {
             panic!("expected Entity::Struct");
         };
-        assert_eq!(s.name, "GetApiValueRawTimeseriesQuery");
+        assert_eq!(s.name, "GetApiValueRawByIdTimeseriesQuery");
         assert_eq!(s.kind, EntityKind::Query);
         assert_eq!(s.fields.len(), 1);
         assert_eq!(s.fields[0].name, "from");

@@ -102,7 +102,7 @@ pub fn generate(spec: &OpenAPI, config: &Config) -> Result<GeneratedCrate> {
         Vec::new()
     };
     let routes = if config.emit_server {
-        server::parse::parse_routes(spec, config)
+        server::parse::parse_routes(spec, config, &mut diagnostics)
     } else {
         Vec::new()
     };

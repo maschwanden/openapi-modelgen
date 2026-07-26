@@ -51,19 +51,39 @@ pub(crate) fn to_pascal_case(s: &str) -> String {
     result
 }
 
-/// Derive a PascalCase name from an HTTP method and path.
+/// Derive a unique, valid PascalCase identifier from an HTTP method and path.
 ///
-/// E.g. `("get", "/api/value-raw/{id}/timeseries")` → `"GetValueRawTimeseries"`.
-/// Path parameters like `{id}` are stripped.
+/// Used when an operation has no `operationId`. Every path segment contributes,
+/// including path parameters (as `By{Name}`), so sibling paths like `/things`
+/// and `/things/{id}` yield distinct names (`GetThings` vs `GetThingsById`)
+/// instead of colliding into the same trait method / query struct. Any
+/// non-alphanumeric character in a segment (e.g. the `.` in `openapi.yaml`) is
+/// treated as a word boundary so the result is always a valid Rust identifier.
+///
+/// E.g. `("get", "/api/value-raw/{id}/timeseries")` → `"GetApiValueRawByIdTimeseries"`.
 pub(crate) fn query_name_from_path(method: &str, path: &str) -> String {
-    let segments = path
-        .split('/')
-        .filter(|s| !s.is_empty() && !s.starts_with('{'));
-    let mut name = to_pascal_case(method);
-    for segment in segments {
-        name.push_str(&to_pascal_case(segment));
+    let mut name = pascal_segment(method);
+    for segment in path.split('/').filter(|s| !s.is_empty()) {
+        match segment.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
+            Some(param) => {
+                name.push_str("By");
+                name.push_str(&pascal_segment(param));
+            }
+            None => name.push_str(&pascal_segment(segment)),
+        }
     }
     name
+}
+
+/// PascalCase a single path/identifier fragment, treating every non-alphanumeric
+/// character as a word boundary (so `openapi.yaml` → `OpenapiYaml`, `value-raw`
+/// → `ValueRaw`). Keeps the derived name a valid Rust identifier fragment.
+fn pascal_segment(s: &str) -> String {
+    let sanitized: String = s
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    to_pascal_case(&sanitized)
 }
 
 /// Extract the schema name from a `$ref` string (e.g. `#/components/schemas/Foo` -> `Foo`).

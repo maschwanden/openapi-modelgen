@@ -7,14 +7,19 @@ use super::Route;
 use crate::common::{
     query_name_from_path, resolve_parameter_ref, resolve_ref_name, to_pascal_case, to_snake_case,
 };
-use crate::{Config, ServerStyle};
+use crate::diagnostics::{Severity, record};
+use crate::{Config, Diagnostic, ServerStyle};
 
 /// Parse the routing table (one [`Route`] per HTTP operation) from a spec.
 ///
 /// This is intentionally separate from model parsing: models are always
 /// generated, but routes are only needed when server generation is requested.
 /// Per-operation `server-style` and `security` are resolved here.
-pub(crate) fn parse_routes(spec: &OpenAPI, config: &Config) -> Vec<Route> {
+pub(crate) fn parse_routes(
+    spec: &OpenAPI,
+    config: &Config,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Vec<Route> {
     let global_secured = spec.security.as_ref().is_some_and(|reqs| !reqs.is_empty());
     let mut routes = Vec::new();
 
@@ -47,7 +52,46 @@ pub(crate) fn parse_routes(spec: &OpenAPI, config: &Config) -> Vec<Route> {
         }
     }
 
+    diagnose_duplicate_handlers(&routes, diagnostics);
     routes
+}
+
+/// Record a diagnostic for any trait-method name shared by more than one
+/// `strict` route. Duplicate names would be an `E0428` in the generated trait,
+/// so this surfaces the collision — almost always a spec with missing or
+/// duplicate operationIds — as a diagnostic instead of cryptic non-compiling
+/// output. (With distinct path segments the derived names no longer collide;
+/// this catches duplicate operationIds and pathological path shapes.)
+fn diagnose_duplicate_handlers(routes: &[Route], diagnostics: &mut Vec<Diagnostic>) {
+    use std::collections::{HashMap, HashSet};
+
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    for r in routes
+        .iter()
+        .filter(|r| r.server_style == ServerStyle::Strict)
+    {
+        *counts.entry(r.handler.as_str()).or_default() += 1;
+    }
+    let mut reported: HashSet<&str> = HashSet::new();
+    for r in routes
+        .iter()
+        .filter(|r| r.server_style == ServerStyle::Strict)
+    {
+        let handler = r.handler.as_str();
+        if counts[handler] > 1 && reported.insert(handler) {
+            record(
+                diagnostics,
+                Severity::Dropped,
+                format!("Api::{handler}"),
+                "duplicate operation name",
+                format!(
+                    "{n} operations map to the trait method `{handler}`; give them distinct \
+                     operationIds (the generated trait would not compile otherwise)",
+                    n = counts[handler],
+                ),
+            );
+        }
+    }
 }
 
 /// Resolve the effective `server-style` for an operation: a per-operation
@@ -294,7 +338,7 @@ mod tests {
         config
             .operation_styles
             .insert("deleteThing".into(), ServerStyle::Manual);
-        let routes = parse_routes(&spec, &config);
+        let routes = parse_routes(&spec, &config, &mut Vec::new());
         assert_eq!(
             find(&routes, "get", "/things").server_style,
             ServerStyle::Strict
@@ -313,7 +357,7 @@ mod tests {
             "{HEADER}security:\n  - apiKey: []\npaths:\n  /a:\n    get:\n      operationId: a\n      responses:\n        \"200\":\n          description: ok\n  /b:\n    get:\n      operationId: b\n      security: []\n      responses:\n        \"200\":\n          description: ok\n  /c:\n    get:\n      operationId: c\n      security:\n        - apiKey: []\n      responses:\n        \"200\":\n          description: ok\n"
         );
         let spec = load_spec(&yaml)?;
-        let routes = parse_routes(&spec, &Config::new("x".into(), false));
+        let routes = parse_routes(&spec, &Config::new("x".into(), false), &mut Vec::new());
         assert!(find(&routes, "get", "/a").secured, "inherits global");
         assert!(!find(&routes, "get", "/b").secured, "security: [] opts out");
         assert!(find(&routes, "get", "/c").secured, "explicit op security");
@@ -326,7 +370,7 @@ mod tests {
             "{HEADER}paths:\n  /a:\n    get:\n      operationId: a\n      responses:\n        \"200\":\n          description: ok\n"
         );
         let spec = load_spec(&yaml)?;
-        let routes = parse_routes(&spec, &Config::new("x".into(), false));
+        let routes = parse_routes(&spec, &Config::new("x".into(), false), &mut Vec::new());
         assert!(!find(&routes, "get", "/a").secured);
         Ok(())
     }
@@ -337,7 +381,7 @@ mod tests {
             "{HEADER}paths:\n  /things:\n    get:\n      operationId: listThings\n      responses:\n        \"200\":\n          description: ok\n          content:\n            application/json:\n              schema:\n                type: array\n                items:\n                  $ref: \"#/components/schemas/Thing\"\ncomponents:\n  schemas:\n    Thing:\n      type: object\n      properties:\n        id:\n          type: string\n"
         );
         let spec = load_spec(&yaml)?;
-        let routes = parse_routes(&spec, &Config::new("x".into(), false));
+        let routes = parse_routes(&spec, &Config::new("x".into(), false), &mut Vec::new());
         let r = find(&routes, "get", "/things");
         assert_eq!(r.response_type.as_deref(), Some("Thing"));
         assert!(r.response_array, "array response should set response_array");
@@ -350,11 +394,49 @@ mod tests {
             "{HEADER}paths:\n  /things/{{thing_id}}:\n    get:\n      operationId: getThing\n      parameters:\n        - name: thing_id\n          in: path\n          required: true\n          schema:\n            type: integer\n            format: int64\n      responses:\n        \"200\":\n          description: ok\n"
         );
         let spec = load_spec(&yaml)?;
-        let routes = parse_routes(&spec, &Config::new("x".into(), false));
+        let routes = parse_routes(&spec, &Config::new("x".into(), false), &mut Vec::new());
         let r = find(&routes, "get", "/things/{thing_id}");
         assert_eq!(
             r.path_params,
             vec![("thing_id".to_string(), "i64".to_string())]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn sibling_paths_get_unique_names_without_operation_ids() -> Result<()> {
+        // No operationIds: `/things` and `/things/{id}` used to both derive
+        // `get_things` (path param stripped) — a duplicate trait method.
+        let yaml = format!(
+            "{HEADER}paths:\n  /things:\n    get:\n      responses:\n        \"200\":\n          description: ok\n  /things/{{id}}:\n    get:\n      parameters:\n        - name: id\n          in: path\n          required: true\n          schema:\n            type: string\n      responses:\n        \"200\":\n          description: ok\n"
+        );
+        let spec = load_spec(&yaml)?;
+        let mut diags = Vec::new();
+        let routes = parse_routes(&spec, &Config::new("x".into(), false), &mut diags);
+        assert_eq!(find(&routes, "get", "/things").handler, "get_things");
+        assert_eq!(
+            find(&routes, "get", "/things/{id}").handler,
+            "get_things_by_id"
+        );
+        assert!(diags.is_empty(), "unique names → no diagnostic: {diags:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn duplicate_operation_ids_are_diagnosed() -> Result<()> {
+        let yaml = format!(
+            "{HEADER}paths:\n  /a:\n    get:\n      operationId: sameName\n      responses:\n        \"200\":\n          description: ok\n  /b:\n    get:\n      operationId: sameName\n      responses:\n        \"200\":\n          description: ok\n"
+        );
+        let spec = load_spec(&yaml)?;
+        let mut diags = Vec::new();
+        let _ = parse_routes(&spec, &Config::new("x".into(), false), &mut diags);
+        assert_eq!(
+            diags
+                .iter()
+                .filter(|d| d.construct == "duplicate operation name")
+                .count(),
+            1,
+            "one diagnostic per colliding name: {diags:?}"
         );
         Ok(())
     }
