@@ -10,6 +10,7 @@ Given an OpenAPI spec, `openapi-modelgen` produces a self-contained Rust crate w
 - **`src/lib.rs`**: module declarations and re-exports
 - **`src/model.rs`**: Rust structs derived from `components/schemas` (with `Serialize` + `Deserialize`) and query parameter structs from path operations (with `Deserialize`)
 - **`src/validation.rs`**: a `Validation` trait with `validate()` implementations that enforce OpenAPI constraints at runtime
+- **`src/server.rs`** (opt-in, with `--server` or a config file): a framework-agnostic `Api` trait — one method per operation, typed with the generated model types — plus an optional axum adapter. See [Configuration file](#configuration-file)
 
 ### Supported features
 
@@ -45,7 +46,8 @@ Validation errors include field paths for nested structs (e.g. `child.name: leng
 - **Non-`$ref` members of a `oneOf`**: inline-object members of a top-level `oneOf` are skipped (logged as a warning); only `$ref` members become variants.
 - **`anyOf` / `allOf`**: not supported. Schemas using them are dropped (top-level) or degrade to `serde_json::Value` (as a field).
 - **Untagged union cardinality is not enforced**: an untagged `oneOf` (no discriminator) deserializes to the first matching variant; the "exactly one match" rule is not validated at runtime.
-- **Request/response bodies, `additionalProperties` (maps), header/cookie parameters, non-local `$ref`s, and non-object/non-string-enum top-level schemas** are not generated.
+- **Inline request/response body schemas**: a body or response is never turned into a named type on its own. When you generate a server, bodies and responses that `$ref` a `components/schemas` entry are wired into the `Api` trait as typed arguments / return values; one written *inline* (not a `$ref`) is not — the operation then gets no `body` argument and returns `()`. Reference a named schema to have it typed.
+- **`additionalProperties` (maps), header/cookie parameters, non-local `$ref`s, and non-object/non-string-enum top-level schemas** are not generated.
 
 None of these are silent: every construct that is dropped or degraded is reported as a **diagnostic**. The CLI prints a summary to stderr after generation, and library callers get the full list in `GeneratedCrate.diagnostics`. Pass `--strict` to make the CLI exit non-zero when anything was not fully generated (a CI gate for lossless generation).
 
