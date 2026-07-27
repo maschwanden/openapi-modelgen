@@ -26,7 +26,7 @@ pub use model::{
     AliasDef, Constraints, Entity, EntityKind, EnumDef, Field, ResponseEnumDef, StructDef,
     UnionDef, UnionVariant,
 };
-pub use server::Route;
+pub use server::{Route, RouteRespVariant, RouteResponse};
 
 /// How a server operation is served.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]

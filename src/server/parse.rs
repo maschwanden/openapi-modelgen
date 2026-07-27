@@ -3,9 +3,10 @@ use openapiv3::{
     VariantOrUnknownOrEmpty,
 };
 
-use super::Route;
+use super::{Route, RouteRespVariant, RouteResponse};
 use crate::common::{
-    query_name_from_path, resolve_parameter_ref, resolve_ref_name, to_pascal_case, to_snake_case,
+    operation_base_name, query_name_from_path, resolve_parameter_ref, resolve_ref_name,
+    success_response_media, to_pascal_case, to_snake_case,
 };
 use crate::diagnostics::{Severity, record};
 use crate::{Config, Diagnostic, ServerStyle};
@@ -123,22 +124,34 @@ fn build_route(
     server_style: ServerStyle,
     secured: bool,
 ) -> Route {
-    let handler = match &op.operation_id {
-        // Normalise via PascalCase → snake_case so camelCase / kebab-case /
-        // snake_case operationIds all yield a valid snake_case identifier.
-        Some(id) => to_snake_case(&to_pascal_case(id)),
-        None => to_snake_case(&query_name_from_path(method, path)),
-    };
+    // Normalise via PascalCase → snake_case so camelCase / kebab-case /
+    // snake_case operationIds all yield a valid snake_case identifier.
+    let handler = to_snake_case(&operation_base_name(op, method, path));
 
     let body_type = op.request_body.as_ref().and_then(|rb| match rb {
         ReferenceOr::Item(rb) => json_schema_ref_name(rb.content.get("application/json")),
         ReferenceOr::Reference { .. } => None,
     });
 
-    let (success_status, response) = success_response(&op.responses);
-    let (response_type, response_array) = match response {
-        Some((name, is_array)) => (Some(name), is_array),
-        None => (None, false),
+    let (success_status, media) = success_response_media(&op.responses);
+    let response = match media.as_slice() {
+        [] => RouteResponse::Empty,
+        [only] => RouteResponse::Single {
+            rust_type: only.crate_type.clone(),
+            media_type: only.media_type.clone(),
+            is_json: only.is_json,
+        },
+        _ => RouteResponse::Negotiated {
+            enum_name: format!("{}Response", operation_base_name(op, method, path)),
+            variants: media
+                .iter()
+                .map(|m| RouteRespVariant {
+                    variant: m.variant.clone(),
+                    media_type: m.media_type.clone(),
+                    is_json: m.is_json,
+                })
+                .collect(),
+        },
     };
 
     Route {
@@ -148,8 +161,7 @@ fn build_route(
         path_params: path_params(op, components, path),
         query_type: query_struct_name(op, components, method, path),
         body_type,
-        response_type,
-        response_array,
+        response,
         success_status,
         server_style,
         secured,
@@ -256,53 +268,6 @@ fn query_struct_name(
     })
 }
 
-/// The operation's success (2xx) response: its HTTP status code and, when the
-/// JSON body is a `$ref` (or array of `$ref`), the body type.
-///
-/// Prefers a 2xx response that carries a representable JSON body; otherwise the
-/// first declared 2xx (e.g. a `204` empty response). Falls back to `200` / no
-/// body when the operation declares no 2xx response. The status code is honored
-/// by the axum adapter so `201`/`204` no longer regress to `200`.
-fn success_response(responses: &openapiv3::Responses) -> (u16, Option<(String, bool)>) {
-    let mut chosen: Option<(u16, Option<(String, bool)>)> = None;
-    for (code, resp_ref) in &responses.responses {
-        let openapiv3::StatusCode::Code(code) = code else {
-            continue;
-        };
-        if !(200..300).contains(code) {
-            continue;
-        }
-        let body = match resp_ref {
-            ReferenceOr::Item(resp) => response_schema_type(resp.content.get("application/json")),
-            ReferenceOr::Reference { .. } => None,
-        };
-        match &chosen {
-            // Keep the first 2xx seen, but upgrade to one that carries a body.
-            None => chosen = Some((*code, body)),
-            Some((_, None)) if body.is_some() => chosen = Some((*code, body)),
-            _ => {}
-        }
-    }
-    chosen.unwrap_or((200, None))
-}
-
-/// Resolve a response media type to `(schema_name, is_array)`. A direct `$ref`
-/// yields `(name, false)`; an array whose `items` is a `$ref` yields
-/// `(name, true)` → `Vec<name>`. Other inline schemas are unsupported.
-fn response_schema_type(media: Option<&openapiv3::MediaType>) -> Option<(String, bool)> {
-    match media?.schema.as_ref()? {
-        ReferenceOr::Reference { reference } => Some((resolve_ref_name(reference), false)),
-        ReferenceOr::Item(schema) => {
-            if let openapiv3::SchemaKind::Type(openapiv3::Type::Array(arr)) = &schema.schema_kind
-                && let Some(ReferenceOr::Reference { reference }) = &arr.items
-            {
-                return Some((resolve_ref_name(reference), true));
-            }
-            None
-        }
-    }
-}
-
 /// Given the `application/json` media type (if present), return the referenced
 /// schema name. Inline (non-`$ref`) bodies are unsupported in this prototype.
 fn json_schema_ref_name(media: Option<&openapiv3::MediaType>) -> Option<String> {
@@ -383,8 +348,14 @@ mod tests {
         let spec = load_spec(&yaml)?;
         let routes = parse_routes(&spec, &Config::new("x".into(), false), &mut Vec::new());
         let r = find(&routes, "get", "/things");
-        assert_eq!(r.response_type.as_deref(), Some("Thing"));
-        assert!(r.response_array, "array response should set response_array");
+        assert_eq!(
+            r.response,
+            RouteResponse::Single {
+                rust_type: "Vec<crate::Thing>".into(),
+                media_type: "application/json".into(),
+                is_json: true,
+            }
+        );
         Ok(())
     }
 

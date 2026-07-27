@@ -29,10 +29,8 @@ pub struct Route {
     pub query_type: Option<String>,
     /// Request-body struct name (a `$ref` schema), if a JSON body is present.
     pub body_type: Option<String>,
-    /// Success (200/201) response struct name (a `$ref` schema), if any.
-    pub response_type: Option<String>,
-    /// Whether the success response is a `Vec` of `response_type` (array schema).
-    pub response_array: bool,
+    /// The success response shape (empty / single body / content-negotiated).
+    pub response: RouteResponse,
     /// The success HTTP status code declared in the spec (e.g. `201`, `204`).
     /// Emitted by the axum adapter so the response is not always `200`.
     pub success_status: u16,
@@ -42,6 +40,38 @@ pub struct Route {
     /// Whether an OpenAPI `security` requirement is in effect for this operation.
     /// When true, the generated method receives an `auth: Self::Auth` argument.
     pub secured: bool,
+}
+
+/// The success-response shape of a [`Route`].
+#[derive(Debug, PartialEq)]
+pub enum RouteResponse {
+    /// No representable body (e.g. `204`) — the method returns `()`.
+    Empty,
+    /// A single body. `is_json` selects the axum `Json` wrapper vs a raw body
+    /// with an explicit `Content-Type`. `rust_type` is crate-qualified
+    /// (`crate::MemberList`, `Vec<crate::Member>`, `String`, `Vec<u8>`).
+    Single {
+        rust_type: String,
+        media_type: String,
+        is_json: bool,
+    },
+    /// More than one media type → the generated `{Op}Response` enum; each
+    /// variant is rendered with its own `Content-Type`.
+    Negotiated {
+        enum_name: String,
+        variants: Vec<RouteRespVariant>,
+    },
+}
+
+/// One media variant of a [`RouteResponse::Negotiated`] response.
+#[derive(Debug, PartialEq)]
+pub struct RouteRespVariant {
+    /// Enum variant name (`Json`, `Csv`, …).
+    pub variant: String,
+    /// MIME type used for the `Content-Type` header.
+    pub media_type: String,
+    /// Whether this variant is rendered via `axum::Json`.
+    pub is_json: bool,
 }
 
 /// Generate `src/server.rs`: a framework-agnostic `Api` trait plus an opt-in
@@ -116,12 +146,12 @@ pub(crate) fn server_rs(routes: &[Route], emit_axum: bool) -> Result<String, std
     Ok(out)
 }
 
-/// The success/response type for a route as a Rust type string.
+/// The trait method's success return type as a Rust type string.
 pub(crate) fn route_response_type(route: &Route) -> String {
-    match &route.response_type {
-        Some(t) if route.response_array => format!("Vec<crate::{t}>"),
-        Some(t) => format!("crate::{t}"),
-        None => "()".to_string(),
+    match &route.response {
+        RouteResponse::Empty => "()".to_string(),
+        RouteResponse::Single { rust_type, .. } => rust_type.clone(),
+        RouteResponse::Negotiated { enum_name, .. } => format!("crate::{enum_name}"),
     }
 }
 
@@ -193,11 +223,19 @@ mod tests {
             path_params: vec![],
             query_type: None,
             body_type: None,
-            response_type: None,
-            response_array: false,
+            response: RouteResponse::Empty,
             success_status: 200,
             server_style: ServerStyle::Strict,
             secured: false,
+        }
+    }
+
+    /// A single JSON body response of `crate::{name}`.
+    fn json_resp(name: &str) -> RouteResponse {
+        RouteResponse::Single {
+            rust_type: format!("crate::{name}"),
+            media_type: "application/json".into(),
+            is_json: true,
         }
     }
 
@@ -205,17 +243,17 @@ mod tests {
         vec![
             Route {
                 query_type: Some("ListThingsQuery".into()),
-                response_type: Some("Thing".into()),
+                response: json_resp("Thing"),
                 ..route("get", "/things", "list_things")
             },
             Route {
                 body_type: Some("Thing".into()),
-                response_type: Some("Thing".into()),
+                response: json_resp("Thing"),
                 ..route("post", "/things", "create_thing")
             },
             Route {
                 path_params: vec![("id".into(), "i64".into())],
-                response_type: Some("Thing".into()),
+                response: json_resp("Thing"),
                 ..route("get", "/things/{id}", "get_thing_by_id")
             },
         ]
@@ -308,8 +346,11 @@ mod tests {
     #[test]
     fn array_response_becomes_vec() -> Result {
         let routes = vec![Route {
-            response_type: Some("Thing".into()),
-            response_array: true,
+            response: RouteResponse::Single {
+                rust_type: "Vec<crate::Thing>".into(),
+                media_type: "application/json".into(),
+                is_json: true,
+            },
             ..route("get", "/things", "list_things")
         }];
         let krate = crate::assemble(&[], &routes, &server_config())?;

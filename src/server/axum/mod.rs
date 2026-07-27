@@ -2,8 +2,17 @@
 
 use std::fmt::Write;
 
-use super::{Route, path_param_ident};
+use super::{Route, RouteResponse, path_param_ident};
 use crate::common::escape_keyword;
+
+/// Whether a response renders at least one JSON body (needs the `Json` import).
+fn response_has_json(response: &RouteResponse) -> bool {
+    match response {
+        RouteResponse::Empty => false,
+        RouteResponse::Single { is_json, .. } => *is_json,
+        RouteResponse::Negotiated { variants, .. } => variants.iter().any(|v| v.is_json),
+    }
+}
 
 /// Emit the `#[cfg(feature = "server-axum")] mod axum_impl { .. }` block plus the
 /// `pub use axum_impl::router;` re-export. Operates on the already-filtered
@@ -17,7 +26,7 @@ pub(crate) fn write_axum_module(
     let needs_query = routes.iter().any(|r| r.query_type.is_some());
     let needs_json = routes
         .iter()
-        .any(|r| r.body_type.is_some() || r.response_type.is_some());
+        .any(|r| r.body_type.is_some() || response_has_json(&r.response));
     let needs_validation = routes
         .iter()
         .any(|r| r.query_type.is_some() || r.body_type.is_some());
@@ -145,12 +154,16 @@ fn status_code_expr(code: u16) -> String {
 fn write_handler_fn(out: &mut String, route: &Route) -> std::fmt::Result {
     let call = escape_keyword(&route.handler);
     let status = status_code_expr(route.success_status);
-    let (ret_ty, wrap_call) = match &route.response_type {
-        Some(_) => (
-            format!("(StatusCode, Json<{}>)", super::route_response_type(route)),
-            true,
-        ),
-        None => ("StatusCode".to_string(), false),
+    // A single JSON body keeps a precise `(StatusCode, Json<T>)` type; raw and
+    // negotiated bodies erase to `axum::response::Response`.
+    let ret_ty = match &route.response {
+        RouteResponse::Empty => "StatusCode".to_string(),
+        RouteResponse::Single { is_json: true, .. } => {
+            format!("(StatusCode, Json<{}>)", super::route_response_type(route))
+        }
+        RouteResponse::Single { is_json: false, .. } | RouteResponse::Negotiated { .. } => {
+            "axum::response::Response".to_string()
+        }
     };
 
     writeln!(
@@ -228,12 +241,50 @@ fn write_handler_fn(out: &mut String, route: &Route) -> std::fmt::Result {
     }
     let args = call_args.join(", ");
 
-    if wrap_call {
-        writeln!(out, "        let __resp = A::{call}({args}).await?;")?;
-        writeln!(out, "        Ok(({status}, Json(__resp)))")?;
-    } else {
-        writeln!(out, "        A::{call}({args}).await?;")?;
-        writeln!(out, "        Ok({status})")?;
+    match &route.response {
+        RouteResponse::Empty => {
+            writeln!(out, "        A::{call}({args}).await?;")?;
+            writeln!(out, "        Ok({status})")?;
+        }
+        RouteResponse::Single { is_json: true, .. } => {
+            writeln!(out, "        let __resp = A::{call}({args}).await?;")?;
+            writeln!(out, "        Ok(({status}, Json(__resp)))")?;
+        }
+        RouteResponse::Single {
+            is_json: false,
+            media_type,
+            ..
+        } => {
+            writeln!(out, "        let __resp = A::{call}({args}).await?;")?;
+            writeln!(
+                out,
+                "        Ok(({status}, [(axum::http::header::CONTENT_TYPE, \"{media_type}\")], __resp).into_response())"
+            )?;
+        }
+        RouteResponse::Negotiated {
+            enum_name,
+            variants,
+        } => {
+            writeln!(out, "        let __resp = A::{call}({args}).await?;")?;
+            writeln!(out, "        Ok(match __resp {{")?;
+            for v in variants {
+                if v.is_json {
+                    writeln!(
+                        out,
+                        "            crate::{enum_name}::{variant}(__v) => ({status}, Json(__v)).into_response(),",
+                        variant = v.variant,
+                    )?;
+                } else {
+                    writeln!(
+                        out,
+                        "            crate::{enum_name}::{variant}(__v) => ({status}, [(axum::http::header::CONTENT_TYPE, \"{media}\")], __v).into_response(),",
+                        variant = v.variant,
+                        media = v.media_type,
+                    )?;
+                }
+            }
+            writeln!(out, "        }})")?;
+        }
     }
     writeln!(out, "    }}")?;
     Ok(())
@@ -241,9 +292,18 @@ fn write_handler_fn(out: &mut String, route: &Route) -> std::fmt::Result {
 
 #[cfg(test)]
 mod tests {
-    use crate::{Config, GeneratedCrate, Route, ServerStyle};
+    use crate::{Config, GeneratedCrate, Route, RouteRespVariant, RouteResponse, ServerStyle};
 
     type Result = std::result::Result<(), Box<dyn std::error::Error>>;
+
+    /// A single JSON body response of `crate::{name}`.
+    fn json_resp(name: &str) -> RouteResponse {
+        RouteResponse::Single {
+            rust_type: format!("crate::{name}"),
+            media_type: "application/json".into(),
+            is_json: true,
+        }
+    }
 
     fn server_config() -> Config {
         let mut c = Config::new("test_api".to_string(), false);
@@ -269,8 +329,7 @@ mod tests {
             path_params: vec![],
             query_type: None,
             body_type: None,
-            response_type: None,
-            response_array: false,
+            response: RouteResponse::Empty,
             success_status: 200,
             server_style: ServerStyle::Strict,
             secured: false,
@@ -283,7 +342,7 @@ mod tests {
             // 201 Created, with a body.
             Route {
                 body_type: Some("Thing".into()),
-                response_type: Some("Thing".into()),
+                response: json_resp("Thing"),
                 success_status: 201,
                 ..base("post", "/things", "create_thing")
             },
@@ -311,16 +370,58 @@ mod tests {
     }
 
     #[test]
+    fn handler_content_negotiates() -> Result {
+        let routes = vec![Route {
+            response: RouteResponse::Negotiated {
+                enum_name: "ListThingsResponse".into(),
+                variants: vec![
+                    RouteRespVariant {
+                        variant: "Json".into(),
+                        media_type: "application/json".into(),
+                        is_json: true,
+                    },
+                    RouteRespVariant {
+                        variant: "Csv".into(),
+                        media_type: "text/csv".into(),
+                        is_json: false,
+                    },
+                ],
+            },
+            ..base("get", "/things", "list_things")
+        }];
+        let krate = crate::assemble(&[], &routes, &server_config())?;
+        let server = find_file(&krate, "src/server.rs");
+        assert!(
+            server.contains(
+                "-> impl ::core::future::Future<Output = Result<crate::ListThingsResponse, Self::Error>> + Send;"
+            ),
+            "trait returns the response enum: {server}"
+        );
+        assert!(
+            server
+                .contains("crate::ListThingsResponse::Json(__v) => (StatusCode::OK, Json(__v)).into_response(),"),
+            "JSON variant rendered via Json: {server}"
+        );
+        assert!(
+            server.contains(
+                "crate::ListThingsResponse::Csv(__v) => (StatusCode::OK, [(axum::http::header::CONTENT_TYPE, \"text/csv\")], __v).into_response(),"
+            ),
+            "CSV variant rendered with Content-Type: {server}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn router_wires_every_strict_route() -> Result {
         let routes = vec![
             Route {
                 query_type: Some("ListThingsQuery".into()),
-                response_type: Some("Thing".into()),
+                response: json_resp("Thing"),
                 ..base("get", "/things", "list_things")
             },
             Route {
                 body_type: Some("Thing".into()),
-                response_type: Some("Thing".into()),
+                response: json_resp("Thing"),
                 ..base("post", "/things", "create_thing")
             },
         ];
@@ -365,7 +466,7 @@ mod tests {
     fn secured_handler_extracts_auth() -> Result {
         let routes = vec![Route {
             body_type: Some("Thing".into()),
-            response_type: Some("Thing".into()),
+            response: json_resp("Thing"),
             secured: true,
             ..base("post", "/things", "create_thing")
         }];
