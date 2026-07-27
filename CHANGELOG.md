@@ -4,6 +4,25 @@ This document describes notable changes to `openapi-modelgen`, the tool that
 generates a self-contained Rust crate (models, runtime validation, and an
 optional server layer) from an OpenAPI 3.0 spec.
 
+## v0.1.13 (2026-07-27)
+
+### Added
+
+- Content-negotiated responses. An operation whose success response declares
+  more than one media type now generates a `{Operation}Response` enum (e.g.
+  `enum ListMembersResponse { Json(MemberList), Csv(String) }`) — a model-layer
+  type, so it is available in models-only mode too. The `Api` trait method
+  returns it, and the axum adapter renders each variant with its own
+  `Content-Type`. Negotiation is impl-owned and CSV/binary bodies stay
+  hand-written; only the route and the JSON model are compile-enforced. This
+  lets CSV-export endpoints be `strict` instead of hand-wired `manual`.
+
+### Fixed
+
+- A single non-JSON success body (a pure `text/csv` or `application/octet-stream`
+  download) is now returned with its `Content-Type` instead of regressing to an
+  empty `200`.
+
 ## v0.1.12 (2026-07-26)
 
 ### Added
