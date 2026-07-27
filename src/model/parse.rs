@@ -4,10 +4,12 @@ use openapiv3::{
 };
 
 use super::{
-    AliasDef, Constraints, Entity, EntityKind, EnumDef, Field, StructDef, UnionDef, UnionVariant,
+    AliasDef, Constraints, Entity, EntityKind, EnumDef, Field, ResponseEnumDef, StructDef,
+    UnionDef, UnionVariant,
 };
 use crate::common::{
-    parameter_data, query_name_from_path, resolve_parameter_ref, resolve_ref_name, to_pascal_case,
+    operation_base_name, parameter_data, query_name_from_path, resolve_parameter_ref,
+    resolve_ref_name, success_response_media, to_pascal_case,
 };
 use crate::{
     Diagnostic,
@@ -92,6 +94,9 @@ pub fn parse_with_diagnostics(spec: &OpenAPI, diagnostics: &mut Vec<Diagnostic>)
             if let Some(entity) =
                 parse_query(op, spec.components.as_ref(), method, path, diagnostics)
             {
+                entities.push(entity);
+            }
+            if let Some(entity) = parse_response_enum(op, method, path) {
                 entities.push(entity);
             }
         }
@@ -595,6 +600,24 @@ fn parse_query(
         kind: EntityKind::Query,
         fields,
         enums: Vec::new(),
+    }))
+}
+
+/// Parse an operation whose success response offers more than one media type
+/// into a content-negotiated response enum (`{Operation}Response`). Single-body
+/// (or bodiless) responses produce nothing here — the server returns the body
+/// type directly. Generated in model mode so hand-written servers can use it too.
+fn parse_response_enum(op: &Operation, method: &str, path: &str) -> Option<Entity> {
+    let (_, media) = success_response_media(&op.responses);
+    if media.len() < 2 {
+        return None;
+    }
+    Some(Entity::ResponseEnum(ResponseEnumDef {
+        name: format!("{}Response", operation_base_name(op, method, path)),
+        variants: media
+            .into_iter()
+            .map(|m| (m.variant, m.model_type))
+            .collect(),
     }))
 }
 

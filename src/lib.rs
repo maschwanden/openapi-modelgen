@@ -23,7 +23,8 @@ pub use diagnostics::{Diagnostic, Severity};
 pub use error::Result;
 pub use model::parse::{parse, parse_with_diagnostics};
 pub use model::{
-    AliasDef, Constraints, Entity, EntityKind, EnumDef, Field, StructDef, UnionDef, UnionVariant,
+    AliasDef, Constraints, Entity, EntityKind, EnumDef, Field, ResponseEnumDef, StructDef,
+    UnionDef, UnionVariant,
 };
 pub use server::Route;
 
@@ -124,7 +125,7 @@ pub(crate) fn assemble(
 ) -> std::result::Result<GeneratedCrate, std::fmt::Error> {
     let struct_fields = entities.iter().filter_map(|e| match e {
         Entity::Struct(s) => Some(s.fields.as_slice()),
-        Entity::Enum(_) | Entity::Union(_) | Entity::Alias(_) => None,
+        Entity::Enum(_) | Entity::Union(_) | Entity::Alias(_) | Entity::ResponseEnum(_) => None,
     });
 
     let needs_regex = struct_fields.clone().any(|fields| {
@@ -374,6 +375,50 @@ components:
             crate_.diagnostics.is_empty(),
             "array schema should no longer be dropped: {:?}",
             crate_.diagnostics
+        );
+        Ok(())
+    }
+
+    /// An operation whose success response offers >1 media type generates a
+    /// content-negotiated response enum — even in models-only mode.
+    #[test]
+    fn content_negotiated_response_enum() -> Result<()> {
+        let yaml = r##"
+openapi: "3.0.3"
+info:
+  title: Test
+  version: "0.1.0"
+paths:
+  /members:
+    get:
+      operationId: listMembers
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MemberList"
+            text/csv:
+              schema:
+                type: string
+components:
+  schemas:
+    MemberList:
+      type: object
+      properties:
+        size:
+          type: integer
+          format: int64
+"##;
+        // test_config() is model-only (server generation off).
+        let crate_ = generate(&load_spec(yaml)?, &test_config())?;
+        let model = file_content(&crate_, "src/model.rs");
+        assert!(
+            model.contains("pub enum ListMembersResponse {")
+                && model.contains("Json(MemberList),")
+                && model.contains("Csv(String),"),
+            "missing content-negotiated response enum: {model}"
         );
         Ok(())
     }

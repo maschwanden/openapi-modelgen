@@ -125,7 +125,7 @@ pub(crate) fn model_rs(
 ) -> Result<String, std::fmt::Error> {
     let struct_fields = entities.iter().filter_map(|e| match e {
         Entity::Struct(s) => Some(&s.fields),
-        Entity::Enum(_) | Entity::Union(_) | Entity::Alias(_) => None,
+        Entity::Enum(_) | Entity::Union(_) | Entity::Alias(_) | Entity::ResponseEnum(_) => None,
     });
     let alias_types = || {
         entities.iter().filter_map(|e| match e {
@@ -230,6 +230,20 @@ use serde::{{Deserialize, Serialize}};{uuid_import}
         }
     }
 
+    // Emit content-negotiated response enums (one variant per media type). Plain
+    // enums (no serde) — each variant is rendered with its own Content-Type.
+    for entity in entities {
+        if let Entity::ResponseEnum(re) = entity {
+            writeln!(out)?;
+            writeln!(out, "#[derive(Debug)]")?;
+            writeln!(out, "pub enum {} {{", re.name)?;
+            for (variant, ty) in &re.variants {
+                writeln!(out, "    {variant}({ty}),")?;
+            }
+            writeln!(out, "}}")?;
+        }
+    }
+
     Ok(out)
 }
 
@@ -317,7 +331,7 @@ pub(crate) fn default_rs(
 ) -> Result<String, std::fmt::Error> {
     let struct_fields_with_name = entities.iter().filter_map(|e| match e {
         Entity::Struct(s) => Some((&s.name, &s.fields)),
-        Entity::Enum(_) | Entity::Union(_) | Entity::Alias(_) => None,
+        Entity::Enum(_) | Entity::Union(_) | Entity::Alias(_) | Entity::ResponseEnum(_) => None,
     });
 
     // Determine which chrono/uuid imports are needed in default functions
@@ -465,6 +479,8 @@ impl<T: Validation> Validation for Vec<T> {{
             Entity::Union(u) => write_union_validation_impl(&mut out, u)?,
             // A `Vec<T>` alias is covered by the blanket `Validation for Vec<T>`.
             Entity::Alias(_) => {}
+            // Response enums are rendering descriptors, not validated inputs.
+            Entity::ResponseEnum(_) => {}
         }
     }
 

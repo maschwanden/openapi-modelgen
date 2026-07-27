@@ -37,6 +37,22 @@ pub enum Entity {
     /// A type alias generated from a schema whose root is an array,
     /// e.g. `pub type TagArray = Vec<Tag>;`.
     Alias(AliasDef),
+    /// An enum generated from an operation whose success response offers more
+    /// than one media type, e.g. `enum ListMembersResponse { Json(MemberList), Csv(String) }`.
+    ResponseEnum(ResponseEnumDef),
+}
+
+/// A content-negotiated response type generated from an operation.
+///
+/// One variant per representable success-response media type. It is a rendering
+/// descriptor, not a wire type: each variant is emitted with its own
+/// `Content-Type`, so it derives only `Debug` (no serde).
+#[derive(Debug, PartialEq)]
+pub struct ResponseEnumDef {
+    /// Enum name in PascalCase (e.g. `ListMembersResponse`).
+    pub name: String,
+    /// Variants as `(variant_name, model_local_type)`, e.g. `("Json", "MemberList")`.
+    pub variants: Vec<(String, String)>,
 }
 
 /// A top-level type alias generated from an array schema.
