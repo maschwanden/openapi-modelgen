@@ -7,7 +7,7 @@ use openapiv3::{
 
 use crate::{
     Constraints, Diagnostic, Entity, EntityKind, EnumDef, Field, StructDef, UnionDef, UnionVariant,
-    diagnostics::{Severity, record},
+    diagnostic::{Severity, record},
 };
 
 /// Parse an OpenAPI spec into a list of entities, discarding diagnostics.

@@ -3,7 +3,7 @@ use std::fmt::Write;
 use crate::{
     Config, Constraints, Diagnostic, Entity, EntityKind, EnumDef, Field, GeneratedCrate,
     GeneratedFile, UnionDef,
-    diagnostics::{Severity, record},
+    diagnostic::{Severity, record},
     parse::to_snake_case,
 };
 

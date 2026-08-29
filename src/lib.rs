@@ -5,12 +5,12 @@
     clippy::too_many_lines
 )]
 
-mod diagnostics;
+mod diagnostic;
 mod error;
 mod parse;
 mod write;
 
-pub use diagnostics::{Diagnostic, Severity};
+pub use diagnostic::{Diagnostic, Severity};
 pub use parse::{parse, parse_with_diagnostics};
 pub use write::write;
 

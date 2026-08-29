@@ -1,9 +1,8 @@
 //! Diagnostics for spec constructs the generator cannot fully represent.
 //!
-//! The generator only emits code for a subset of OpenAPI. Historically the
-//! unsupported parts were dropped or degraded silently, so a spec could
-//! "generate successfully" while quietly losing whole types. A [`Diagnostic`]
-//! records each such loss so it can be surfaced to the user (CLI summary) and
+//! The generator only emits code for a subset of OpenAPI. To prevent
+//! unsupported parts being dropped or degraded silently, [`Diagnostic`]s
+//! record each such loss so they can be surfaced to the user (CLI summary) and
 //! to library callers (returned from [`crate::generate`]).
 
 use std::fmt;
@@ -20,7 +19,7 @@ pub enum Severity {
 }
 
 impl Severity {
-    /// Lowercase label used in rendered messages (e.g. `"dropped"`).
+    /// Lowercase label used in rendered messages.
     pub fn label(self) -> &'static str {
         match self {
             Severity::Dropped => "dropped",
