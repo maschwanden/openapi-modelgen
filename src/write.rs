@@ -32,13 +32,14 @@ pub fn write(entities: &[Entity], config: &Config) -> Result<GeneratedCrate, std
 
     let (enum_name_map, _) = resolve_inline_enums(entities);
 
-    let mut diagnostics = Vec::new();
     // Resolve every field's Rust identifier once: model.rs, default.rs and
     // validation.rs must all spell the same field the same way.
-    let field_idents = resolve_field_idents(entities, &mut diagnostics);
+    let (field_idents, mut diagnostics) = resolve_field_idents(entities);
     // Render every field default once; both model.rs and default.rs consume the
     // result, and unrenderable defaults are reported here (a single site).
-    let default_literals = compute_default_literals(entities, &enum_name_map, &mut diagnostics);
+    let (default_literals, mut default_diagnostics) =
+        compute_default_literals(entities, &enum_name_map);
+    diagnostics.append(&mut default_diagnostics);
 
     // Keyed off the rendered literals, not off `default_value`: a default the
     // spec declares but the writer cannot render produces no function, so
@@ -96,8 +97,9 @@ type FieldIdents = std::collections::HashMap<(String, String), String>;
 /// Sanitizing can map two properties of one struct onto a single identifier
 /// (`first-name` and `first.name`), which no naming choice resolves honestly,
 /// so that is [`Severity::Fatal`] and [`crate::generate`] fails on it.
-fn resolve_field_idents(entities: &[Entity], diagnostics: &mut Vec<Diagnostic>) -> FieldIdents {
+fn resolve_field_idents(entities: &[Entity]) -> (FieldIdents, Vec<Diagnostic>) {
     let mut idents = FieldIdents::new();
+    let mut diagnostics = Vec::new();
     for entity in entities {
         let Entity::Struct(s) = entity else { continue };
         // Field identifier → the first property that claimed it.
@@ -105,7 +107,7 @@ fn resolve_field_idents(entities: &[Entity], diagnostics: &mut Vec<Diagnostic>) 
         for field in &s.fields {
             let Some(ident) = to_field_ident(&field.name) else {
                 record(
-                    diagnostics,
+                    &mut diagnostics,
                     Severity::Fatal,
                     format!("{}.{}", s.name, field.name),
                     "property name",
@@ -118,7 +120,7 @@ fn resolve_field_idents(entities: &[Entity], diagnostics: &mut Vec<Diagnostic>) 
             };
             if let Some(first) = taken.get(&ident) {
                 record(
-                    diagnostics,
+                    &mut diagnostics,
                     Severity::Fatal,
                     format!("{}.{}", s.name, field.name),
                     "property name",
@@ -134,7 +136,7 @@ fn resolve_field_idents(entities: &[Entity], diagnostics: &mut Vec<Diagnostic>) 
             idents.insert((s.name.clone(), field.name.clone()), ident);
         }
     }
-    idents
+    (idents, diagnostics)
 }
 
 /// The Rust identifier a field is emitted with, or `None` for a property name
@@ -177,9 +179,9 @@ type DefaultLiterals = std::collections::HashMap<(String, String), String>;
 fn compute_default_literals(
     entities: &[Entity],
     enum_name_map: &EnumNameMap,
-    diagnostics: &mut Vec<Diagnostic>,
-) -> DefaultLiterals {
+) -> (DefaultLiterals, Vec<Diagnostic>) {
     let mut literals = DefaultLiterals::new();
+    let mut diagnostics = Vec::new();
     for entity in entities {
         let Entity::Struct(s) = entity else { continue };
         for field in &s.fields {
@@ -199,7 +201,7 @@ fn compute_default_literals(
                     literals.insert((s.name.clone(), field.name.clone()), literal);
                 }
                 None => record(
-                    diagnostics,
+                    &mut diagnostics,
                     Severity::Degraded,
                     format!("{}.{}", s.name, field.name),
                     "default value",
@@ -208,7 +210,7 @@ fn compute_default_literals(
             }
         }
     }
-    literals
+    (literals, diagnostics)
 }
 
 /// The Rust type name a field is emitted with, before `Option` wrapping.

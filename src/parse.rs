@@ -17,246 +17,1022 @@ use crate::{
 /// A caller with no use for the diagnostics discards them at the call site
 /// (`let (entities, _) = parse(spec)`), which is visible where it happens.
 pub fn parse(spec: &OpenAPI) -> (Vec<Entity>, Vec<Diagnostic>) {
-    let mut diagnostics = Vec::new();
-    let entities = parse_entities(spec, &mut diagnostics);
-    (entities, diagnostics)
+    let mut parser = Parser::default();
+    let entities = parser.entities(spec);
+    (entities, parser.diagnostics)
 }
 
-/// The parse itself. Diagnostics are threaded as `&mut` here, as they are
-/// through every function below; only the public boundary hands back a list.
-fn parse_entities(spec: &OpenAPI, diagnostics: &mut Vec<Diagnostic>) -> Vec<Entity> {
-    let mut entities = Vec::new();
+/// Collects diagnostics while it walks the spec.
+///
+/// The collector is the receiver rather than an out-parameter, so no function
+/// below carries a `&mut Vec<Diagnostic>` and none of them can drop a
+/// diagnostic by forgetting to merge one.
+#[derive(Default)]
+struct Parser {
+    diagnostics: Vec<Diagnostic>,
+}
 
-    if let Some(components) = &spec.components {
-        // Schema names are sanitized into Rust type names, so two schemas can
-        // land on the same one (`foo-bar` and `foo_bar` both give `FooBar`).
-        // Neither generating both nor picking one is defensible, since the
-        // `$ref`s to them are indistinguishable, so the clash is fatal.
-        let mut type_names: std::collections::HashMap<String, String> =
-            std::collections::HashMap::new();
-        for (name, ref_or) in &components.schemas {
-            let schema = match ref_or {
-                ReferenceOr::Item(schema) => schema,
-                ReferenceOr::Reference { reference } => {
-                    record(
-                        diagnostics,
-                        Severity::Dropped,
+impl Parser {
+    fn record(
+        &mut self,
+        severity: Severity,
+        path: impl Into<String>,
+        construct: impl Into<String>,
+        reason: impl Into<String>,
+    ) {
+        record(&mut self.diagnostics, severity, path, construct, reason);
+    }
+
+    /// Walk the spec and build every entity it yields.
+    fn entities(&mut self, spec: &OpenAPI) -> Vec<Entity> {
+        let mut entities = Vec::new();
+
+        if let Some(components) = &spec.components {
+            // Schema names are sanitized into Rust type names, so two schemas can
+            // land on the same one (`foo-bar` and `foo_bar` both give `FooBar`).
+            // Neither generating both nor picking one is defensible, since the
+            // `$ref`s to them are indistinguishable, so the clash is fatal.
+            let mut type_names: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
+            for (name, ref_or) in &components.schemas {
+                let schema = match ref_or {
+                    ReferenceOr::Item(schema) => schema,
+                    ReferenceOr::Reference { reference } => {
+                        self.record(
+                            Severity::Dropped,
+                            format!("components.schemas.{name}"),
+                            "$ref schema",
+                            format!(
+                                "top-level schema is a $ref to `{reference}`; no type was generated"
+                            ),
+                        );
+                        continue;
+                    }
+                };
+
+                let Some(type_name) = to_type_ident(name) else {
+                    self.record(
+                        Severity::Fatal,
                         format!("components.schemas.{name}"),
-                        "$ref schema",
+                        "schema",
+                        format!("schema name \"{name}\" has nothing a Rust name can be built from"),
+                    );
+                    continue;
+                };
+                if let Some(first) = type_names.get(&type_name) {
+                    self.record(
+                        Severity::Fatal,
+                        format!("components.schemas.{name}"),
+                        "schema",
                         format!(
-                            "top-level schema is a $ref to `{reference}`; no type was generated"
+                            "schemas \"{first}\" and \"{name}\" would both become \
+                             the Rust type `{type_name}`"
+                        ),
+                    );
+                } else {
+                    type_names.insert(type_name.clone(), name.clone());
+                }
+                let entity = self
+                    .parse_schema(name, schema)
+                    .or_else(|| self.parse_one_of(name, schema))
+                    .or_else(|| {
+                        self.parse_enum(name, schema, &format!("components.schemas.{name}"))
+                            .map(Entity::Enum)
+                    });
+
+                match entity {
+                    Some(entity) => entities.push(entity),
+                    None => self.diagnose_unsupported_schema(name, schema),
+                }
+            }
+        }
+
+        for (path, path_item_ref) in spec.paths.iter() {
+            let path_item = match path_item_ref {
+                ReferenceOr::Item(item) => item,
+                ReferenceOr::Reference { reference } => {
+                    self.record(
+                        Severity::Dropped,
+                        path.clone(),
+                        "$ref path item",
+                        format!(
+                            "path item is a $ref to `{reference}`; no operations were generated"
                         ),
                     );
                     continue;
                 }
             };
 
-            let Some(type_name) = to_type_ident(name) else {
-                record(
-                    diagnostics,
+            let ops: [(&str, &Option<Operation>); 5] = [
+                ("get", &path_item.get),
+                ("put", &path_item.put),
+                ("post", &path_item.post),
+                ("patch", &path_item.patch),
+                ("delete", &path_item.delete),
+            ];
+            for (method, op) in ops {
+                let Some(op) = op else { continue };
+                self.diagnose_operation_bodies(op, spec.components.as_ref(), method, path);
+                if let Some(entity) = self.parse_query(op, spec.components.as_ref(), method, path) {
+                    entities.push(entity);
+                }
+            }
+        }
+
+        // Unions are built optimistically per schema; only now, with the whole
+        // entity list in hand, can their members be checked against what was
+        // actually generated.
+        self.resolve_unions(&mut entities);
+
+        // Only now is the final type list known, so only now can a field's type be
+        // checked against it.
+        let spec_schema_names: HashSet<String> = spec
+            .components
+            .as_ref()
+            .map(|components| components.schemas.keys().cloned().collect())
+            .unwrap_or_default();
+        self.diagnose_undefined_field_types(&entities, &spec_schema_names);
+
+        entities
+    }
+
+    /// Post-pass that makes every `oneOf` union sound.
+    ///
+    /// [`parse_one_of`] sees one schema at a time, so it cannot tell whether a
+    /// member `$ref` names a type that was actually generated, nor what shape that
+    /// type has. With the full entity list this pass:
+    ///
+    /// * drops variants whose member produced no type (e.g. an `allOf` schema),
+    ///   which would otherwise reference a nonexistent Rust type;
+    /// * drops non-struct variants of a *tagged* union, since serde's internally tagged
+    ///   representation requires each payload to serialize as a map, and a variant
+    ///   wrapping an enum or scalar silently round-trips to garbage;
+    /// * drops variants whose PascalCase name collides with an earlier one, which
+    ///   would emit a duplicate enum variant;
+    /// * removes the discriminator property from every member struct of a tagged
+    ///   union (see [`strip_discriminator_properties`]);
+    /// * removes a union left with no usable variants at all.
+    fn resolve_unions(&mut self, entities: &mut Vec<Entity>) {
+        let mut struct_names = HashSet::new();
+        let mut generated_names = HashSet::new();
+        for entity in entities.iter() {
+            match entity {
+                Entity::Struct(s) => {
+                    struct_names.insert(s.name.clone());
+                    generated_names.insert(s.name.clone());
+                }
+                Entity::Enum(e) => {
+                    generated_names.insert(e.name.clone());
+                }
+                Entity::Union(u) => {
+                    generated_names.insert(u.name.clone());
+                }
+            }
+        }
+
+        // Unions that already got a per-member diagnostic; if such a union ends up
+        // empty, the member reports explain it and a schema-level drop would just
+        // restate them.
+        let mut reported = HashSet::new();
+        // `(member type, discriminator property)` pairs to strip afterwards.
+        let mut tags_to_strip = Vec::new();
+
+        for entity in entities.iter_mut() {
+            let Entity::Union(union_def) = entity else {
+                continue;
+            };
+            let path = format!("components.schemas.{}", union_def.name);
+            let tagged = union_def.tag.is_some();
+
+            let mut seen = HashSet::new();
+            let mut kept = Vec::new();
+            for variant in std::mem::take(&mut union_def.variants) {
+                let drop_reason = if !generated_names.contains(&variant.inner_type) {
+                    Some(format!(
+                        "member `{}` has no generated type; the variant was dropped",
+                        variant.inner_type
+                    ))
+                } else if tagged && !struct_names.contains(&variant.inner_type) {
+                    Some(format!(
+                        "member `{}` is not an object schema, so a discriminated union cannot wrap it; the variant was dropped",
+                        variant.inner_type
+                    ))
+                } else if !seen.insert(variant.variant_name.clone()) {
+                    Some(format!(
+                        "member `{}` maps to variant `{}`, which is already taken; the variant was dropped",
+                        variant.inner_type, variant.variant_name
+                    ))
+                } else {
+                    None
+                };
+
+                match drop_reason {
+                    Some(reason) => {
+                        reported.insert(union_def.name.clone());
+                        self.record(Severity::Dropped, path.clone(), "oneOf member", reason);
+                    }
+                    None => kept.push(variant),
+                }
+            }
+
+            if let Some(tag) = &union_def.tag {
+                for variant in &kept {
+                    tags_to_strip.push((variant.inner_type.clone(), tag.clone()));
+                }
+            }
+            union_def.variants = kept;
+        }
+
+        strip_discriminator_properties(entities, &tags_to_strip);
+
+        entities.retain(|entity| {
+            let Entity::Union(union_def) = entity else {
+                return true;
+            };
+            if !union_def.variants.is_empty() {
+                return true;
+            }
+            if !reported.contains(&union_def.name) {
+                self.record(
+                    Severity::Dropped,
+                    format!("components.schemas.{}", union_def.name),
+                    "oneOf",
+                    "no member of the oneOf produced a usable variant; no type was generated",
+                );
+            }
+            false
+        });
+    }
+
+    /// Report fields typed with something that was never generated.
+    ///
+    /// A `$ref` to a schema that is not in the spec, or to one that produced no
+    /// type (an `allOf` schema, a `oneOf` whose members were all dropped), leaves
+    /// the field naming a type nothing defines. The generator cannot invent it and
+    /// the crate will not compile, so this is fatal. External `$ref`s are excluded:
+    /// they are unsupported by design and carry their own diagnostic.
+    fn diagnose_undefined_field_types(
+        &mut self,
+        entities: &[Entity],
+        spec_schema_names: &HashSet<String>,
+    ) {
+        let generated: HashSet<&str> = entities
+            .iter()
+            .map(|entity| match entity {
+                Entity::Struct(s) => s.name.as_str(),
+                Entity::Enum(e) => e.name.as_str(),
+                Entity::Union(u) => u.name.as_str(),
+            })
+            .collect();
+
+        for entity in entities {
+            let Entity::Struct(s) = entity else { continue };
+            for field in &s.fields {
+                // An inline enum's type is generated by the writer, so it is not in
+                // the entity list.
+                if field.is_inline_enum {
+                    continue;
+                }
+                if field
+                    .ref_target
+                    .as_deref()
+                    .is_some_and(|reference| !is_local_schema_ref(reference))
+                {
+                    continue;
+                }
+                let ty = element_type(&field.rust_type);
+                if BUILTIN_TYPES.contains(&ty) || generated.contains(ty) {
+                    continue;
+                }
+
+                let reason = match &field.ref_target {
+                    Some(reference) => {
+                        let target = resolve_ref_name(reference);
+                        if spec_schema_names.contains(&target) {
+                            format!(
+                                "$ref \"{reference}\" names schema `{target}`, which produced no type"
+                            )
+                        } else {
+                            format!("$ref \"{reference}\" names a schema that does not exist")
+                        }
+                    }
+                    None => format!("field type `{ty}` was never generated"),
+                };
+                self.record(
                     Severity::Fatal,
-                    format!("components.schemas.{name}"),
-                    "schema",
-                    format!("schema name \"{name}\" has nothing a Rust name can be built from"),
+                    format!("{}.{}", s.name, field.name),
+                    "$ref",
+                    reason,
+                );
+            }
+        }
+    }
+
+    /// Record a diagnostic for a top-level schema whose kind the generator does not
+    /// turn into a type. `oneOf` member-level losses are reported inside
+    /// [`parse_one_of`]; this covers the schema-level drop.
+    fn diagnose_unsupported_schema(&mut self, name: &str, schema: &Schema) {
+        let path = format!("components.schemas.{name}");
+        let (construct, reason): (&str, &str) = match &schema.schema_kind {
+            SchemaKind::AllOf { .. } => (
+                "allOf",
+                "allOf composition is not supported; no type was generated",
+            ),
+            SchemaKind::AnyOf { .. } => (
+                "anyOf",
+                "anyOf composition is not supported; no type was generated",
+            ),
+            SchemaKind::Not { .. } => (
+                "not",
+                "`not` schemas are not supported; no type was generated",
+            ),
+            SchemaKind::Any(_) => (
+                "free-form schema",
+                "free-form/ambiguous schema; no type was generated",
+            ),
+            SchemaKind::OneOf { .. } => (
+                "oneOf",
+                "oneOf has no usable local $ref members; no type was generated",
+            ),
+            SchemaKind::Type(Type::String(_)) => (
+                "string schema",
+                "top-level string type alias (or non-string enum) is not generated as a distinct type",
+            ),
+            SchemaKind::Type(Type::Integer(_)) => (
+                "integer schema",
+                "top-level integer schema (including integer enums) is not generated as a distinct type",
+            ),
+            SchemaKind::Type(Type::Number(_)) => (
+                "number schema",
+                "top-level number type alias is not generated as a distinct type",
+            ),
+            SchemaKind::Type(Type::Boolean(_)) => (
+                "boolean schema",
+                "top-level boolean type alias is not generated as a distinct type",
+            ),
+            SchemaKind::Type(Type::Array(_)) => (
+                "array schema",
+                "top-level array type alias is not generated as a distinct type",
+            ),
+            // Objects are always handled by `parse_schema`; nothing to report.
+            SchemaKind::Type(Type::Object(_)) => return,
+        };
+        self.record(Severity::Dropped, path, construct, reason);
+    }
+
+    /// Record diagnostics for operation request/response bodies, which are never
+    /// parsed into types.
+    ///
+    /// A body is a loss only when its content schema is *inline*; a `$ref` content
+    /// schema points at a component we do generate. `$ref` bodies/responses are
+    /// resolved against `components`, then the same inline check applies: an
+    /// unresolvable `$ref` (external or missing) is itself a genuine loss.
+    fn diagnose_operation_bodies(
+        &mut self,
+        op: &Operation,
+        components: Option<&openapiv3::Components>,
+        method: &str,
+        path: &str,
+    ) {
+        let location = format!("{} {path}", method.to_uppercase());
+
+        // Request body: a loss only when its content schema is inline. A `$ref`
+        // body is resolved first; an unresolvable `$ref` is itself a loss.
+        if let Some(ref_or) = &op.request_body {
+            let resolved = match ref_or {
+                ReferenceOr::Item(body) => Some(body),
+                ReferenceOr::Reference { reference } => {
+                    let body = resolve_request_body(reference, components);
+                    if body.is_none() {
+                        self.record(
+                            Severity::Dropped,
+                            location.clone(),
+                            "request body",
+                            format!("could not resolve request body $ref `{reference}`"),
+                        );
+                    }
+                    body
+                }
+            };
+            if let Some(body) = resolved
+                && content_has_inline_schema(body.content.values())
+            {
+                self.record(
+                    Severity::Dropped,
+                    location.clone(),
+                    "request body",
+                    "inline request body schema is not generated as a named type",
+                );
+            }
+        }
+
+        // Responses (every status plus the `default` response). Each status is
+        // reported separately so the diagnostic names the response that was lost.
+        let by_status = op
+            .responses
+            .responses
+            .iter()
+            .map(|(status, response_ref)| (status.to_string(), response_ref))
+            .chain(
+                op.responses
+                    .default
+                    .iter()
+                    .map(|response_ref| ("default".to_string(), response_ref)),
+            );
+        for (status, response_ref) in by_status {
+            let response_path = format!("{location}#{status}");
+            let resolved = match response_ref {
+                ReferenceOr::Item(response) => Some(response),
+                ReferenceOr::Reference { reference } => {
+                    let response = resolve_response(reference, components);
+                    if response.is_none() {
+                        self.record(
+                            Severity::Dropped,
+                            response_path.clone(),
+                            "response body",
+                            format!("could not resolve response $ref `{reference}`"),
+                        );
+                    }
+                    response
+                }
+            };
+            if let Some(response) = resolved
+                && content_has_inline_schema(response.content.values())
+            {
+                self.record(
+                    Severity::Dropped,
+                    response_path,
+                    "response body",
+                    "inline response body schema is not generated as a named type",
+                );
+            }
+        }
+    }
+
+    fn parse_schema(&mut self, name: &str, schema: &Schema) -> Option<Entity> {
+        let SchemaKind::Type(Type::Object(obj)) = &schema.schema_kind else {
+            return None;
+        };
+
+        // A map-shaped object (`additionalProperties` with an empty property set) is
+        // generated as an empty struct, silently dropping the map value type.
+        if has_meaningful_additional_properties(obj) {
+            self.record(
+                Severity::Degraded,
+                format!("components.schemas.{name}"),
+                "additionalProperties",
+                "additionalProperties is ignored; map values are not represented in the generated struct",
+            );
+        }
+
+        let mut fields = Vec::new();
+        let mut enums = Vec::new();
+
+        for (field_name, field_ref) in &obj.properties {
+            let required = obj.required.contains(field_name);
+            let context = format!("{name}.{field_name}");
+
+            // Check for inline string enums. `is_inline_enum` is recorded per field
+            // rather than re-derived from the name later: a `$ref` field pointing at
+            // a schema that happens to share an inline enum's name is NOT an enum
+            // field, and conflating the two silently mistypes it.
+            let (rust_type, nullable, is_inline_enum) = match field_ref {
+                ReferenceOr::Item(field_schema) => {
+                    if let Some(enum_def) = self.parse_enum(field_name, field_schema, &context) {
+                        let ty = enum_def.name.clone();
+                        let nullable = field_schema.schema_data.nullable;
+                        enums.push(enum_def);
+                        (ty, nullable, true)
+                    } else {
+                        let (ty, nullable) = self.map_schema_to_type(field_schema, &context);
+                        (ty, nullable, false)
+                    }
+                }
+                ReferenceOr::Reference { .. } => {
+                    let (ty, nullable) = self.resolve_field_type(field_ref, &context);
+                    (ty, nullable, false)
+                }
+            };
+
+            // Extract default value (only for supported types).
+            let mut default_value = match field_ref {
+                ReferenceOr::Item(field_schema) => self.extract_default(
+                    &field_schema.schema_data.default,
+                    &rust_type,
+                    is_inline_enum,
+                    &context,
+                ),
+                ReferenceOr::Reference { .. } => None,
+            };
+
+            // An inline enum default must name one of the enum's values; otherwise
+            // codegen would emit a nonexistent variant (uncompilable). Drop it.
+            if is_inline_enum && let Some(serde_json::Value::String(value)) = &default_value {
+                let valid = enums
+                    .last()
+                    .is_some_and(|e| e.variants.iter().any(|(_, original)| original == value));
+                if !valid {
+                    self.record(
+                        Severity::Degraded,
+                        context.clone(),
+                        "enum default",
+                        format!("default `{value}` is not one of the enum's values; ignored"),
+                    );
+                    default_value = None;
+                }
+            }
+
+            let has_default = default_value.is_some();
+            let is_optional = if has_default {
+                nullable
+            } else {
+                !required || nullable
+            };
+
+            // If the field was converted to an enum type, serde handles validation,
+            // no runtime constraints needed.
+            let constraints = if is_inline_enum {
+                Constraints::None
+            } else {
+                match field_ref {
+                    ReferenceOr::Reference { .. } => Constraints::Nested,
+                    ReferenceOr::Item(field_schema) => {
+                        if let SchemaKind::Type(Type::Array(arr)) = &field_schema.schema_kind {
+                            if let Some(ReferenceOr::Reference { .. }) = &arr.items {
+                                Constraints::VecNested
+                            } else {
+                                extract_constraints(field_schema)
+                            }
+                        } else {
+                            extract_constraints(field_schema)
+                        }
+                    }
+                }
+            };
+
+            fields.push(Field {
+                name: field_name.clone(),
+                rust_type,
+                ref_target: field_ref_target(field_ref),
+                is_optional,
+                constraints,
+                default_value,
+                is_inline_enum,
+            });
+        }
+
+        Some(Entity::Struct(StructDef {
+            name: to_type_ident(name)?,
+            kind: EntityKind::Schema,
+            fields,
+            enums,
+        }))
+    }
+
+    /// If the schema is a string with enum values, generate an EnumDef.
+    ///
+    /// Enum values are arbitrary strings (`10min`, `a.b`, `""`), so every variant
+    /// name goes through [`to_variant_ident`]; the original value is kept for the
+    /// `#[serde(rename)]` that preserves the wire format.
+    ///
+    /// Sanitizing can map two distinct values onto one name: `a.b` and `a-b` both
+    /// give `AB`, and a value that needed the `Variant` prefix can land on one that
+    /// spells it out (`10min` and `Variant10min`). There is no good answer at that
+    /// point: dropping a value makes it undeserializable, and suffixing one puts a
+    /// variant in the generated API that appears nowhere in the spec, so the
+    /// collision is [`Severity::Fatal`] and generation fails. The colliding variant
+    /// is still emitted (uncompilable rather than quietly wrong) for callers that
+    /// go through [`parse`] and ignore diagnostics.
+    fn parse_enum(&mut self, name: &str, schema: &Schema, context: &str) -> Option<EnumDef> {
+        let SchemaKind::Type(Type::String(s)) = &schema.schema_kind else {
+            return None;
+        };
+        let values: Vec<String> = s.enumeration.iter().filter_map(Clone::clone).collect();
+        if values.is_empty() {
+            return None;
+        }
+
+        let mut seen_values = HashSet::new();
+        // Variant name → the first value that claimed it, for the collision report.
+        let mut taken_names: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        let mut variants: Vec<(String, String)> = Vec::new();
+        for value in values {
+            // A repeated value would emit two variants renamed to the same string,
+            // which serde rejects at compile time.
+            if !seen_values.insert(value.clone()) {
+                self.record(
+                    Severity::Dropped,
+                    context.to_string(),
+                    "enum value",
+                    format!("value `{value}` is listed twice; the repeat was dropped"),
+                );
+                continue;
+            }
+
+            let Some(variant) = to_variant_ident(&value) else {
+                self.record(
+                    Severity::Fatal,
+                    context.to_string(),
+                    "enum value",
+                    format!("enum value \"{value}\" has nothing a Rust name can be built from"),
                 );
                 continue;
             };
-            if let Some(first) = type_names.get(&type_name) {
-                record(
-                    diagnostics,
+            if let Some(first) = taken_names.get(&variant) {
+                self.record(
                     Severity::Fatal,
-                    format!("components.schemas.{name}"),
-                    "schema",
+                    context.to_string(),
+                    "enum value",
                     format!(
-                        "schemas \"{first}\" and \"{name}\" would both become \
-                         the Rust type `{type_name}`"
+                        "enum values \"{first}\" and \"{value}\" would both become \
+                         the Rust enum variant `{variant}`"
                     ),
                 );
             } else {
-                type_names.insert(type_name.clone(), name.clone());
+                taken_names.insert(variant.clone(), value.clone());
             }
-            let entity = parse_schema(name, schema, diagnostics)
-                .or_else(|| parse_one_of(name, schema, diagnostics))
-                .or_else(|| {
-                    parse_enum(
-                        name,
-                        schema,
-                        &format!("components.schemas.{name}"),
-                        diagnostics,
-                    )
-                    .map(Entity::Enum)
-                });
-
-            match entity {
-                Some(entity) => entities.push(entity),
-                None => diagnose_unsupported_schema(name, schema, diagnostics),
-            }
+            variants.push((variant, value));
         }
+
+        Some(EnumDef {
+            name: to_type_ident(name)?,
+            variants,
+        })
     }
 
-    for (path, path_item_ref) in spec.paths.iter() {
-        let path_item = match path_item_ref {
-            ReferenceOr::Item(item) => item,
-            ReferenceOr::Reference { reference } => {
+    /// Parse a top-level `oneOf` schema into a union entity.
+    ///
+    /// Each member is expected to be a `$ref` to a local component schema; each
+    /// becomes an enum variant wrapping the referenced type. Inline (non-`$ref`)
+    /// and non-local members are out of scope, so they are skipped. If a
+    /// `discriminator` is present the union is internally tagged, and every variant
+    /// gets a wire value: the `mapping` key when one points at the member,
+    /// otherwise the member's schema name, which is what OpenAPI implies.
+    ///
+    /// Members that survive here are still only *candidates*: whether the
+    /// referenced type exists and has a usable shape is settled by
+    /// [`resolve_unions`], which sees the whole entity list.
+    ///
+    /// Per-member skip diagnostics are buffered and only flushed when a union is
+    /// actually produced (a mix of usable variants and skipped members). If *no*
+    /// variant survives, nothing is recorded here so the single schema-level drop in
+    /// `diagnose_unsupported_schema` fires instead, avoiding a double report for
+    /// the same schema.
+    fn parse_one_of(&mut self, name: &str, schema: &Schema) -> Option<Entity> {
+        let SchemaKind::OneOf { one_of } = &schema.schema_kind else {
+            return None;
+        };
+
+        let path = format!("components.schemas.{name}");
+        let discriminator = schema.schema_data.discriminator.as_ref();
+
+        let mut variants = Vec::new();
+        let mut skipped = Vec::new();
+        for member in one_of {
+            let ReferenceOr::Reference { reference } = member else {
                 record(
-                    diagnostics,
+                    &mut skipped,
                     Severity::Dropped,
                     path.clone(),
-                    "$ref path item",
-                    format!("path item is a $ref to `{reference}`; no operations were generated"),
+                    "inline oneOf member",
+                    "inline (non-$ref) oneOf members are not supported; this variant was skipped",
+                );
+                continue;
+            };
+            // A non-local $ref has no generated type and no valid Rust name; using
+            // it would emit the raw ref string as an identifier.
+            if !is_local_schema_ref(reference) {
+                record(
+                    &mut skipped,
+                    Severity::Dropped,
+                    path.clone(),
+                    "external oneOf member",
+                    format!(
+                        "oneOf member $ref `{reference}` is not a local component schema; the variant was dropped"
+                    ),
                 );
                 continue;
             }
-        };
-
-        let ops: [(&str, &Option<Operation>); 5] = [
-            ("get", &path_item.get),
-            ("put", &path_item.put),
-            ("post", &path_item.post),
-            ("patch", &path_item.patch),
-            ("delete", &path_item.delete),
-        ];
-        for (method, op) in ops {
-            let Some(op) = op else { continue };
-            diagnose_operation_bodies(op, spec.components.as_ref(), method, path, diagnostics);
-            if let Some(entity) =
-                parse_query(op, spec.components.as_ref(), method, path, diagnostics)
-            {
-                entities.push(entity);
-            }
-        }
-    }
-
-    // Unions are built optimistically per schema; only now, with the whole
-    // entity list in hand, can their members be checked against what was
-    // actually generated.
-    resolve_unions(&mut entities, diagnostics);
-
-    // Only now is the final type list known, so only now can a field's type be
-    // checked against it.
-    let spec_schema_names: HashSet<String> = spec
-        .components
-        .as_ref()
-        .map(|components| components.schemas.keys().cloned().collect())
-        .unwrap_or_default();
-    diagnose_undefined_field_types(&entities, &spec_schema_names, diagnostics);
-
-    entities
-}
-
-/// Post-pass that makes every `oneOf` union sound.
-///
-/// [`parse_one_of`] sees one schema at a time, so it cannot tell whether a
-/// member `$ref` names a type that was actually generated, nor what shape that
-/// type has. With the full entity list this pass:
-///
-/// * drops variants whose member produced no type (e.g. an `allOf` schema),
-///   which would otherwise reference a nonexistent Rust type;
-/// * drops non-struct variants of a *tagged* union, since serde's internally tagged
-///   representation requires each payload to serialize as a map, and a variant
-///   wrapping an enum or scalar silently round-trips to garbage;
-/// * drops variants whose PascalCase name collides with an earlier one, which
-///   would emit a duplicate enum variant;
-/// * removes the discriminator property from every member struct of a tagged
-///   union (see [`strip_discriminator_properties`]);
-/// * removes a union left with no usable variants at all.
-fn resolve_unions(entities: &mut Vec<Entity>, diagnostics: &mut Vec<Diagnostic>) {
-    let mut struct_names = HashSet::new();
-    let mut generated_names = HashSet::new();
-    for entity in entities.iter() {
-        match entity {
-            Entity::Struct(s) => {
-                struct_names.insert(s.name.clone());
-                generated_names.insert(s.name.clone());
-            }
-            Entity::Enum(e) => {
-                generated_names.insert(e.name.clone());
-            }
-            Entity::Union(u) => {
-                generated_names.insert(u.name.clone());
-            }
-        }
-    }
-
-    // Unions that already got a per-member diagnostic; if such a union ends up
-    // empty, the member reports explain it and a schema-level drop would just
-    // restate them.
-    let mut reported = HashSet::new();
-    // `(member type, discriminator property)` pairs to strip afterwards.
-    let mut tags_to_strip = Vec::new();
-
-    for entity in entities.iter_mut() {
-        let Entity::Union(union_def) = entity else {
-            continue;
-        };
-        let path = format!("components.schemas.{}", union_def.name);
-        let tagged = union_def.tag.is_some();
-
-        let mut seen = HashSet::new();
-        let mut kept = Vec::new();
-        for variant in std::mem::take(&mut union_def.variants) {
-            let drop_reason = if !generated_names.contains(&variant.inner_type) {
-                Some(format!(
-                    "member `{}` has no generated type; the variant was dropped",
-                    variant.inner_type
-                ))
-            } else if tagged && !struct_names.contains(&variant.inner_type) {
-                Some(format!(
-                    "member `{}` is not an object schema, so a discriminated union cannot wrap it; the variant was dropped",
-                    variant.inner_type
-                ))
-            } else if !seen.insert(variant.variant_name.clone()) {
-                Some(format!(
-                    "member `{}` maps to variant `{}`, which is already taken; the variant was dropped",
-                    variant.inner_type, variant.variant_name
-                ))
-            } else {
-                None
+            let ref_name = resolve_ref_name(reference);
+            // The schema name is the wire value; the Rust type derives from it.
+            let Some(type_name) = to_type_ident(&ref_name) else {
+                record(
+                    &mut skipped,
+                    Severity::Dropped,
+                    path.clone(),
+                    "oneOf member",
+                    format!(
+                        "member `{ref_name}` has nothing a Rust name can be built from; \
+                         the variant was dropped"
+                    ),
+                );
+                continue;
             };
 
-            match drop_reason {
-                Some(reason) => {
-                    reported.insert(union_def.name.clone());
-                    record(
-                        diagnostics,
-                        Severity::Dropped,
-                        path.clone(),
-                        "oneOf member",
-                        reason,
-                    );
-                }
-                None => kept.push(variant),
-            }
+            // A discriminator mapping key overrides the wire value; without one,
+            // OpenAPI uses the member's schema name, which is not necessarily the
+            // PascalCase variant name, so it still has to be recorded.
+            let wire_value = discriminator.map(|d| {
+                d.mapping
+                    .iter()
+                    .find_map(|(key, target)| {
+                        (resolve_ref_name(target) == ref_name).then(|| key.clone())
+                    })
+                    .unwrap_or_else(|| ref_name.clone())
+            });
+
+            variants.push(UnionVariant {
+                variant_name: type_name.clone(),
+                inner_type: type_name,
+                wire_value,
+            });
         }
 
-        if let Some(tag) = &union_def.tag {
-            for variant in &kept {
-                tags_to_strip.push((variant.inner_type.clone(), tag.clone()));
-            }
+        if variants.is_empty() {
+            return None;
         }
-        union_def.variants = kept;
+
+        self.diagnostics.append(&mut skipped);
+        Some(Entity::Union(UnionDef {
+            name: to_type_ident(name)?,
+            variants,
+            tag: discriminator.map(|d| d.property_name.clone()),
+        }))
     }
 
-    strip_discriminator_properties(entities, &tags_to_strip);
+    fn parse_query(
+        &mut self,
+        op: &Operation,
+        components: Option<&openapiv3::Components>,
+        method: &str,
+        path: &str,
+    ) -> Option<Entity> {
+        let location = format!("{} {path}", method.to_uppercase());
 
-    entities.retain(|entity| {
-        let Entity::Union(union_def) = entity else {
-            return true;
-        };
-        if !union_def.variants.is_empty() {
-            return true;
+        let mut query_params = Vec::new();
+        for p in &op.parameters {
+            let param = match p {
+                ReferenceOr::Item(param) => param,
+                ReferenceOr::Reference { reference } => {
+                    match resolve_parameter_ref(reference, components) {
+                        Some(param) => param,
+                        None => {
+                            self.record(
+                                Severity::Dropped,
+                                location.clone(),
+                                "$ref parameter",
+                                format!(
+                                    "could not resolve parameter $ref `{reference}`; parameter dropped"
+                                ),
+                            );
+                            continue;
+                        }
+                    }
+                }
+            };
+            match param {
+                openapiv3::Parameter::Query { .. } => query_params.push(param),
+                // Path parameters live in the URL, not the query struct: excluded by design.
+                openapiv3::Parameter::Path { .. } => {}
+                openapiv3::Parameter::Header { parameter_data, .. } => self.record(
+                    Severity::Dropped,
+                    format!("{location}#{}", parameter_data.name),
+                    "header parameter",
+                    "header parameters are not generated",
+                ),
+                openapiv3::Parameter::Cookie { parameter_data, .. } => self.record(
+                    Severity::Dropped,
+                    format!("{location}#{}", parameter_data.name),
+                    "cookie parameter",
+                    "cookie parameters are not generated",
+                ),
+            }
         }
-        if !reported.contains(&union_def.name) {
-            record(
-                diagnostics,
-                Severity::Dropped,
-                format!("components.schemas.{}", union_def.name),
-                "oneOf",
-                "no member of the oneOf produced a usable variant; no type was generated",
+
+        if query_params.is_empty() {
+            return None;
+        }
+
+        // An operationId that yields no name falls back to the path, which always
+        // starts with the HTTP method and so always yields one.
+        let struct_name = op
+            .operation_id
+            .as_deref()
+            .and_then(to_type_ident)
+            .unwrap_or_else(|| query_name_from_path(method, path))
+            + "Query";
+
+        let mut fields = Vec::new();
+
+        for param in &query_params {
+            let data = parameter_data(param);
+            let param_path = format!("{location}#{}", data.name);
+            let openapiv3::ParameterSchemaOrContent::Schema(schema_ref) = &data.format else {
+                self.record(
+                    Severity::Dropped,
+                    param_path,
+                    "content parameter",
+                    "parameter uses `content` instead of `schema`; not generated",
+                );
+                continue;
+            };
+            let (rust_type, nullable) = self.resolve_schema_ref(schema_ref, &param_path);
+
+            let default_value = match schema_ref {
+                ReferenceOr::Item(schema) => self.extract_default(
+                    &schema.schema_data.default,
+                    &rust_type,
+                    false,
+                    &param_path,
+                ),
+                ReferenceOr::Reference { .. } => None,
+            };
+
+            let has_default = default_value.is_some();
+            let is_optional = if has_default {
+                nullable
+            } else {
+                !data.required || nullable
+            };
+
+            let constraints = match schema_ref {
+                ReferenceOr::Reference { .. } => Constraints::Nested,
+                ReferenceOr::Item(schema) => extract_constraints(schema),
+            };
+
+            fields.push(Field {
+                name: data.name.clone(),
+                rust_type,
+                ref_target: match schema_ref {
+                    ReferenceOr::Reference { reference } => Some(reference.clone()),
+                    ReferenceOr::Item(_) => None,
+                },
+                is_optional,
+                constraints,
+                default_value,
+                // Query parameters never generate inline enums.
+                is_inline_enum: false,
+            });
+        }
+
+        Some(Entity::Struct(StructDef {
+            name: struct_name,
+            kind: EntityKind::Query,
+            fields,
+            enums: Vec::new(),
+        }))
+    }
+
+    /// Record a diagnostic for a `$ref` that does not point at a local component
+    /// schema: the generated type name is the raw ref string and will not compile.
+    fn diagnose_ref(&mut self, reference: &str, context: &str) {
+        if !is_local_schema_ref(reference) {
+            self.record(
+                Severity::Degraded,
+                context.to_string(),
+                "external $ref",
+                format!(
+                    "$ref `{reference}` is not a local component schema; the generated type name likely will not compile"
+                ),
             );
         }
-        false
-    });
+    }
+
+    /// Resolve a field's `ReferenceOr<Schema>` to a `(rust_type, nullable)` pair.
+    fn resolve_field_type(
+        &mut self,
+        field_ref: &ReferenceOr<Box<Schema>>,
+        context: &str,
+    ) -> (String, bool) {
+        match field_ref {
+            ReferenceOr::Reference { reference } => {
+                self.diagnose_ref(reference, context);
+                (self.ref_type_name(reference, context), false)
+            }
+            ReferenceOr::Item(schema) => self.map_schema_to_type(schema, context),
+        }
+    }
+
+    /// Resolve a schema reference (used for parameters) to a `(rust_type, nullable)` pair.
+    fn resolve_schema_ref(
+        &mut self,
+        schema_ref: &ReferenceOr<Schema>,
+        context: &str,
+    ) -> (String, bool) {
+        match schema_ref {
+            ReferenceOr::Reference { reference } => {
+                self.diagnose_ref(reference, context);
+                (self.ref_type_name(reference, context), false)
+            }
+            ReferenceOr::Item(schema) => self.map_schema_to_type(schema, context),
+        }
+    }
+
+    /// The Rust type a `$ref` names.
+    ///
+    /// A reference whose target has no Rust name (`#/components/schemas/!!!`) is
+    /// fatal, so the type returned here is never emitted; `serde_json::Value` just
+    /// keeps the signature honest about returning a real type.
+    fn ref_type_name(&mut self, reference: &str, context: &str) -> String {
+        let target = resolve_ref_name(reference);
+        match to_type_ident(&target) {
+            Some(name) => name,
+            None => {
+                self.record(
+                    Severity::Fatal,
+                    context.to_string(),
+                    "$ref",
+                    format!("$ref \"{reference}\" has nothing a Rust name can be built from"),
+                );
+                "serde_json::Value".to_string()
+            }
+        }
+    }
+
+    /// Map an OpenAPI schema to a Rust type string and nullable flag.
+    ///
+    /// Handles string (with date-time format), integer (i32/i64), number (f64),
+    /// boolean, and array types. Falls back to `serde_json::Value` for anything
+    /// else, recording a [`Severity::Degraded`] diagnostic at `context`.
+    fn map_schema_to_type(&mut self, schema: &Schema, context: &str) -> (String, bool) {
+        let nullable = schema.schema_data.nullable;
+
+        match &schema.schema_kind {
+            SchemaKind::Type(Type::String(s)) => {
+                let ty = match &s.format {
+                    VariantOrUnknownOrEmpty::Item(StringFormat::DateTime) => "DateTime<Utc>",
+                    VariantOrUnknownOrEmpty::Item(StringFormat::Date) => "NaiveDate",
+                    VariantOrUnknownOrEmpty::Unknown(f) if f == "uuid" => "Uuid",
+                    _ => "String",
+                };
+                (ty.to_string(), nullable)
+            }
+            SchemaKind::Type(Type::Integer(i)) => {
+                let ty = match i.format {
+                    VariantOrUnknownOrEmpty::Item(IntegerFormat::Int32) => "i32",
+                    _ => "i64",
+                };
+                (ty.to_string(), nullable)
+            }
+            SchemaKind::Type(Type::Number(_)) => ("f64".to_string(), nullable),
+            SchemaKind::Type(Type::Boolean(_)) => ("bool".to_string(), nullable),
+            SchemaKind::Type(Type::Array(arr)) => {
+                let inner = match &arr.items {
+                    Some(ref_or) => {
+                        let (t, _) = self.resolve_field_type(ref_or, context);
+                        t
+                    }
+                    None => {
+                        self.record(
+                            Severity::Degraded,
+                            context.to_string(),
+                            "array without items",
+                            "array has no `items` schema; element type is `serde_json::Value`",
+                        );
+                        "serde_json::Value".to_string()
+                    }
+                };
+                (format!("Vec<{inner}>"), nullable)
+            }
+            other => {
+                self.record(
+                    Severity::Degraded,
+                    context.to_string(),
+                    describe_field_kind(other),
+                    "field type is not supported; generated as `serde_json::Value`",
+                );
+                ("serde_json::Value".to_string(), nullable)
+            }
+        }
+    }
+
+    /// Extract and validate a default value. Returns `Some` if the default is
+    /// supported, `None` otherwise. Records a diagnostic at `context` (the field's
+    /// spec location) when a default is present in the spec but cannot be
+    /// represented in the generated code.
+    fn extract_default(
+        &mut self,
+        raw: &Option<serde_json::Value>,
+        rust_type: &str,
+        is_enum: bool,
+        context: &str,
+    ) -> Option<serde_json::Value> {
+        let value = raw.as_ref()?;
+        if is_supported_default(value, rust_type, is_enum) {
+            Some(value.clone())
+        } else {
+            self.record(
+                Severity::Degraded,
+                context.to_string(),
+                "default value",
+                format!(
+                    "default value {value} ignored (type `{rust_type}` does not support code-generated defaults)"
+                ),
+            );
+            None
+        }
+    }
 }
 
 /// Rust types the generator emits without generating a definition for them.
@@ -271,71 +1047,6 @@ const BUILTIN_TYPES: &[&str] = &[
     "Uuid",
     "serde_json::Value",
 ];
-
-/// Report fields typed with something that was never generated.
-///
-/// A `$ref` to a schema that is not in the spec, or to one that produced no
-/// type (an `allOf` schema, a `oneOf` whose members were all dropped), leaves
-/// the field naming a type nothing defines. The generator cannot invent it and
-/// the crate will not compile, so this is fatal. External `$ref`s are excluded:
-/// they are unsupported by design and carry their own diagnostic.
-fn diagnose_undefined_field_types(
-    entities: &[Entity],
-    spec_schema_names: &HashSet<String>,
-    diagnostics: &mut Vec<Diagnostic>,
-) {
-    let generated: HashSet<&str> = entities
-        .iter()
-        .map(|entity| match entity {
-            Entity::Struct(s) => s.name.as_str(),
-            Entity::Enum(e) => e.name.as_str(),
-            Entity::Union(u) => u.name.as_str(),
-        })
-        .collect();
-
-    for entity in entities {
-        let Entity::Struct(s) = entity else { continue };
-        for field in &s.fields {
-            // An inline enum's type is generated by the writer, so it is not in
-            // the entity list.
-            if field.is_inline_enum {
-                continue;
-            }
-            if field
-                .ref_target
-                .as_deref()
-                .is_some_and(|reference| !is_local_schema_ref(reference))
-            {
-                continue;
-            }
-            let ty = element_type(&field.rust_type);
-            if BUILTIN_TYPES.contains(&ty) || generated.contains(ty) {
-                continue;
-            }
-
-            let reason = match &field.ref_target {
-                Some(reference) => {
-                    let target = resolve_ref_name(reference);
-                    if spec_schema_names.contains(&target) {
-                        format!(
-                            "$ref \"{reference}\" names schema `{target}`, which produced no type"
-                        )
-                    } else {
-                        format!("$ref \"{reference}\" names a schema that does not exist")
-                    }
-                }
-                None => format!("field type `{ty}` was never generated"),
-            };
-            record(
-                diagnostics,
-                Severity::Fatal,
-                format!("{}.{}", s.name, field.name),
-                "$ref",
-                reason,
-            );
-        }
-    }
-}
 
 /// The `$ref` a field's type comes from: the field's own, or its array items'.
 fn field_ref_target(field_ref: &ReferenceOr<Box<Schema>>) -> Option<String> {
@@ -380,58 +1091,6 @@ fn strip_discriminator_properties(entities: &mut [Entity], tags_to_strip: &[(Str
     }
 }
 
-/// Record a diagnostic for a top-level schema whose kind the generator does not
-/// turn into a type. `oneOf` member-level losses are reported inside
-/// [`parse_one_of`]; this covers the schema-level drop.
-fn diagnose_unsupported_schema(name: &str, schema: &Schema, diagnostics: &mut Vec<Diagnostic>) {
-    let path = format!("components.schemas.{name}");
-    let (construct, reason): (&str, &str) = match &schema.schema_kind {
-        SchemaKind::AllOf { .. } => (
-            "allOf",
-            "allOf composition is not supported; no type was generated",
-        ),
-        SchemaKind::AnyOf { .. } => (
-            "anyOf",
-            "anyOf composition is not supported; no type was generated",
-        ),
-        SchemaKind::Not { .. } => (
-            "not",
-            "`not` schemas are not supported; no type was generated",
-        ),
-        SchemaKind::Any(_) => (
-            "free-form schema",
-            "free-form/ambiguous schema; no type was generated",
-        ),
-        SchemaKind::OneOf { .. } => (
-            "oneOf",
-            "oneOf has no usable local $ref members; no type was generated",
-        ),
-        SchemaKind::Type(Type::String(_)) => (
-            "string schema",
-            "top-level string type alias (or non-string enum) is not generated as a distinct type",
-        ),
-        SchemaKind::Type(Type::Integer(_)) => (
-            "integer schema",
-            "top-level integer schema (including integer enums) is not generated as a distinct type",
-        ),
-        SchemaKind::Type(Type::Number(_)) => (
-            "number schema",
-            "top-level number type alias is not generated as a distinct type",
-        ),
-        SchemaKind::Type(Type::Boolean(_)) => (
-            "boolean schema",
-            "top-level boolean type alias is not generated as a distinct type",
-        ),
-        SchemaKind::Type(Type::Array(_)) => (
-            "array schema",
-            "top-level array type alias is not generated as a distinct type",
-        ),
-        // Objects are always handled by `parse_schema`; nothing to report.
-        SchemaKind::Type(Type::Object(_)) => return,
-    };
-    record(diagnostics, Severity::Dropped, path, construct, reason);
-}
-
 /// Whether any media type in a body carries an *inline* schema.
 ///
 /// A `$ref` content schema resolves to a component we generate, so it is not a
@@ -442,531 +1101,6 @@ fn content_has_inline_schema<'a>(
     content
         .into_iter()
         .any(|media| matches!(media.schema, Some(ReferenceOr::Item(_))))
-}
-
-/// Record diagnostics for operation request/response bodies, which are never
-/// parsed into types.
-///
-/// A body is a loss only when its content schema is *inline*; a `$ref` content
-/// schema points at a component we do generate. `$ref` bodies/responses are
-/// resolved against `components`, then the same inline check applies: an
-/// unresolvable `$ref` (external or missing) is itself a genuine loss.
-fn diagnose_operation_bodies(
-    op: &Operation,
-    components: Option<&openapiv3::Components>,
-    method: &str,
-    path: &str,
-    diagnostics: &mut Vec<Diagnostic>,
-) {
-    let location = format!("{} {path}", method.to_uppercase());
-
-    // Request body: a loss only when its content schema is inline. A `$ref`
-    // body is resolved first; an unresolvable `$ref` is itself a loss.
-    if let Some(ref_or) = &op.request_body {
-        let resolved = match ref_or {
-            ReferenceOr::Item(body) => Some(body),
-            ReferenceOr::Reference { reference } => {
-                let body = resolve_request_body(reference, components);
-                if body.is_none() {
-                    record(
-                        diagnostics,
-                        Severity::Dropped,
-                        location.clone(),
-                        "request body",
-                        format!("could not resolve request body $ref `{reference}`"),
-                    );
-                }
-                body
-            }
-        };
-        if let Some(body) = resolved
-            && content_has_inline_schema(body.content.values())
-        {
-            record(
-                diagnostics,
-                Severity::Dropped,
-                location.clone(),
-                "request body",
-                "inline request body schema is not generated as a named type",
-            );
-        }
-    }
-
-    // Responses (every status plus the `default` response). Each status is
-    // reported separately so the diagnostic names the response that was lost.
-    let by_status = op
-        .responses
-        .responses
-        .iter()
-        .map(|(status, response_ref)| (status.to_string(), response_ref))
-        .chain(
-            op.responses
-                .default
-                .iter()
-                .map(|response_ref| ("default".to_string(), response_ref)),
-        );
-    for (status, response_ref) in by_status {
-        let response_path = format!("{location}#{status}");
-        let resolved = match response_ref {
-            ReferenceOr::Item(response) => Some(response),
-            ReferenceOr::Reference { reference } => {
-                let response = resolve_response(reference, components);
-                if response.is_none() {
-                    record(
-                        diagnostics,
-                        Severity::Dropped,
-                        response_path.clone(),
-                        "response body",
-                        format!("could not resolve response $ref `{reference}`"),
-                    );
-                }
-                response
-            }
-        };
-        if let Some(response) = resolved
-            && content_has_inline_schema(response.content.values())
-        {
-            record(
-                diagnostics,
-                Severity::Dropped,
-                response_path,
-                "response body",
-                "inline response body schema is not generated as a named type",
-            );
-        }
-    }
-}
-
-fn parse_schema(name: &str, schema: &Schema, diagnostics: &mut Vec<Diagnostic>) -> Option<Entity> {
-    let SchemaKind::Type(Type::Object(obj)) = &schema.schema_kind else {
-        return None;
-    };
-
-    // A map-shaped object (`additionalProperties` with an empty property set) is
-    // generated as an empty struct, silently dropping the map value type.
-    if has_meaningful_additional_properties(obj) {
-        record(
-            diagnostics,
-            Severity::Degraded,
-            format!("components.schemas.{name}"),
-            "additionalProperties",
-            "additionalProperties is ignored; map values are not represented in the generated struct",
-        );
-    }
-
-    let mut fields = Vec::new();
-    let mut enums = Vec::new();
-
-    for (field_name, field_ref) in &obj.properties {
-        let required = obj.required.contains(field_name);
-        let context = format!("{name}.{field_name}");
-
-        // Check for inline string enums. `is_inline_enum` is recorded per field
-        // rather than re-derived from the name later: a `$ref` field pointing at
-        // a schema that happens to share an inline enum's name is NOT an enum
-        // field, and conflating the two silently mistypes it.
-        let (rust_type, nullable, is_inline_enum) = match field_ref {
-            ReferenceOr::Item(field_schema) => {
-                if let Some(enum_def) = parse_enum(field_name, field_schema, &context, diagnostics)
-                {
-                    let ty = enum_def.name.clone();
-                    let nullable = field_schema.schema_data.nullable;
-                    enums.push(enum_def);
-                    (ty, nullable, true)
-                } else {
-                    let (ty, nullable) = map_schema_to_type(field_schema, &context, diagnostics);
-                    (ty, nullable, false)
-                }
-            }
-            ReferenceOr::Reference { .. } => {
-                let (ty, nullable) = resolve_field_type(field_ref, &context, diagnostics);
-                (ty, nullable, false)
-            }
-        };
-
-        // Extract default value (only for supported types).
-        let mut default_value = match field_ref {
-            ReferenceOr::Item(field_schema) => extract_default(
-                &field_schema.schema_data.default,
-                &rust_type,
-                is_inline_enum,
-                &context,
-                diagnostics,
-            ),
-            ReferenceOr::Reference { .. } => None,
-        };
-
-        // An inline enum default must name one of the enum's values; otherwise
-        // codegen would emit a nonexistent variant (uncompilable). Drop it.
-        if is_inline_enum && let Some(serde_json::Value::String(value)) = &default_value {
-            let valid = enums
-                .last()
-                .is_some_and(|e| e.variants.iter().any(|(_, original)| original == value));
-            if !valid {
-                record(
-                    diagnostics,
-                    Severity::Degraded,
-                    context.clone(),
-                    "enum default",
-                    format!("default `{value}` is not one of the enum's values; ignored"),
-                );
-                default_value = None;
-            }
-        }
-
-        let has_default = default_value.is_some();
-        let is_optional = if has_default {
-            nullable
-        } else {
-            !required || nullable
-        };
-
-        // If the field was converted to an enum type, serde handles validation,
-        // no runtime constraints needed.
-        let constraints = if is_inline_enum {
-            Constraints::None
-        } else {
-            match field_ref {
-                ReferenceOr::Reference { .. } => Constraints::Nested,
-                ReferenceOr::Item(field_schema) => {
-                    if let SchemaKind::Type(Type::Array(arr)) = &field_schema.schema_kind {
-                        if let Some(ReferenceOr::Reference { .. }) = &arr.items {
-                            Constraints::VecNested
-                        } else {
-                            extract_constraints(field_schema)
-                        }
-                    } else {
-                        extract_constraints(field_schema)
-                    }
-                }
-            }
-        };
-
-        fields.push(Field {
-            name: field_name.clone(),
-            rust_type,
-            ref_target: field_ref_target(field_ref),
-            is_optional,
-            constraints,
-            default_value,
-            is_inline_enum,
-        });
-    }
-
-    Some(Entity::Struct(StructDef {
-        name: to_type_ident(name)?,
-        kind: EntityKind::Schema,
-        fields,
-        enums,
-    }))
-}
-
-/// If the schema is a string with enum values, generate an EnumDef.
-///
-/// Enum values are arbitrary strings (`10min`, `a.b`, `""`), so every variant
-/// name goes through [`to_variant_ident`]; the original value is kept for the
-/// `#[serde(rename)]` that preserves the wire format.
-///
-/// Sanitizing can map two distinct values onto one name: `a.b` and `a-b` both
-/// give `AB`, and a value that needed the `Variant` prefix can land on one that
-/// spells it out (`10min` and `Variant10min`). There is no good answer at that
-/// point: dropping a value makes it undeserializable, and suffixing one puts a
-/// variant in the generated API that appears nowhere in the spec, so the
-/// collision is [`Severity::Fatal`] and generation fails. The colliding variant
-/// is still emitted (uncompilable rather than quietly wrong) for callers that
-/// go through [`parse`] and ignore diagnostics.
-fn parse_enum(
-    name: &str,
-    schema: &Schema,
-    context: &str,
-    diagnostics: &mut Vec<Diagnostic>,
-) -> Option<EnumDef> {
-    let SchemaKind::Type(Type::String(s)) = &schema.schema_kind else {
-        return None;
-    };
-    let values: Vec<String> = s.enumeration.iter().filter_map(Clone::clone).collect();
-    if values.is_empty() {
-        return None;
-    }
-
-    let mut seen_values = HashSet::new();
-    // Variant name → the first value that claimed it, for the collision report.
-    let mut taken_names: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
-    let mut variants: Vec<(String, String)> = Vec::new();
-    for value in values {
-        // A repeated value would emit two variants renamed to the same string,
-        // which serde rejects at compile time.
-        if !seen_values.insert(value.clone()) {
-            record(
-                diagnostics,
-                Severity::Dropped,
-                context.to_string(),
-                "enum value",
-                format!("value `{value}` is listed twice; the repeat was dropped"),
-            );
-            continue;
-        }
-
-        let Some(variant) = to_variant_ident(&value) else {
-            record(
-                diagnostics,
-                Severity::Fatal,
-                context.to_string(),
-                "enum value",
-                format!("enum value \"{value}\" has nothing a Rust name can be built from"),
-            );
-            continue;
-        };
-        if let Some(first) = taken_names.get(&variant) {
-            record(
-                diagnostics,
-                Severity::Fatal,
-                context.to_string(),
-                "enum value",
-                format!(
-                    "enum values \"{first}\" and \"{value}\" would both become \
-                     the Rust enum variant `{variant}`"
-                ),
-            );
-        } else {
-            taken_names.insert(variant.clone(), value.clone());
-        }
-        variants.push((variant, value));
-    }
-
-    Some(EnumDef {
-        name: to_type_ident(name)?,
-        variants,
-    })
-}
-
-/// Parse a top-level `oneOf` schema into a union entity.
-///
-/// Each member is expected to be a `$ref` to a local component schema; each
-/// becomes an enum variant wrapping the referenced type. Inline (non-`$ref`)
-/// and non-local members are out of scope, so they are skipped. If a
-/// `discriminator` is present the union is internally tagged, and every variant
-/// gets a wire value: the `mapping` key when one points at the member,
-/// otherwise the member's schema name, which is what OpenAPI implies.
-///
-/// Members that survive here are still only *candidates*: whether the
-/// referenced type exists and has a usable shape is settled by
-/// [`resolve_unions`], which sees the whole entity list.
-///
-/// Per-member skip diagnostics are buffered and only flushed when a union is
-/// actually produced (a mix of usable variants and skipped members). If *no*
-/// variant survives, nothing is recorded here so the single schema-level drop in
-/// `diagnose_unsupported_schema` fires instead, avoiding a double report for
-/// the same schema.
-fn parse_one_of(name: &str, schema: &Schema, diagnostics: &mut Vec<Diagnostic>) -> Option<Entity> {
-    let SchemaKind::OneOf { one_of } = &schema.schema_kind else {
-        return None;
-    };
-
-    let path = format!("components.schemas.{name}");
-    let discriminator = schema.schema_data.discriminator.as_ref();
-
-    let mut variants = Vec::new();
-    let mut skipped = Vec::new();
-    for member in one_of {
-        let ReferenceOr::Reference { reference } = member else {
-            record(
-                &mut skipped,
-                Severity::Dropped,
-                path.clone(),
-                "inline oneOf member",
-                "inline (non-$ref) oneOf members are not supported; this variant was skipped",
-            );
-            continue;
-        };
-        // A non-local $ref has no generated type and no valid Rust name; using
-        // it would emit the raw ref string as an identifier.
-        if !is_local_schema_ref(reference) {
-            record(
-                &mut skipped,
-                Severity::Dropped,
-                path.clone(),
-                "external oneOf member",
-                format!(
-                    "oneOf member $ref `{reference}` is not a local component schema; the variant was dropped"
-                ),
-            );
-            continue;
-        }
-        let ref_name = resolve_ref_name(reference);
-        // The schema name is the wire value; the Rust type derives from it.
-        let Some(type_name) = to_type_ident(&ref_name) else {
-            record(
-                &mut skipped,
-                Severity::Dropped,
-                path.clone(),
-                "oneOf member",
-                format!(
-                    "member `{ref_name}` has nothing a Rust name can be built from; \
-                     the variant was dropped"
-                ),
-            );
-            continue;
-        };
-
-        // A discriminator mapping key overrides the wire value; without one,
-        // OpenAPI uses the member's schema name, which is not necessarily the
-        // PascalCase variant name, so it still has to be recorded.
-        let wire_value = discriminator.map(|d| {
-            d.mapping
-                .iter()
-                .find_map(|(key, target)| {
-                    (resolve_ref_name(target) == ref_name).then(|| key.clone())
-                })
-                .unwrap_or_else(|| ref_name.clone())
-        });
-
-        variants.push(UnionVariant {
-            variant_name: type_name.clone(),
-            inner_type: type_name,
-            wire_value,
-        });
-    }
-
-    if variants.is_empty() {
-        return None;
-    }
-
-    diagnostics.append(&mut skipped);
-    Some(Entity::Union(UnionDef {
-        name: to_type_ident(name)?,
-        variants,
-        tag: discriminator.map(|d| d.property_name.clone()),
-    }))
-}
-
-fn parse_query(
-    op: &Operation,
-    components: Option<&openapiv3::Components>,
-    method: &str,
-    path: &str,
-    diagnostics: &mut Vec<Diagnostic>,
-) -> Option<Entity> {
-    let location = format!("{} {path}", method.to_uppercase());
-
-    let mut query_params = Vec::new();
-    for p in &op.parameters {
-        let param = match p {
-            ReferenceOr::Item(param) => param,
-            ReferenceOr::Reference { reference } => {
-                match resolve_parameter_ref(reference, components) {
-                    Some(param) => param,
-                    None => {
-                        record(
-                            diagnostics,
-                            Severity::Dropped,
-                            location.clone(),
-                            "$ref parameter",
-                            format!(
-                                "could not resolve parameter $ref `{reference}`; parameter dropped"
-                            ),
-                        );
-                        continue;
-                    }
-                }
-            }
-        };
-        match param {
-            openapiv3::Parameter::Query { .. } => query_params.push(param),
-            // Path parameters live in the URL, not the query struct: excluded by design.
-            openapiv3::Parameter::Path { .. } => {}
-            openapiv3::Parameter::Header { parameter_data, .. } => record(
-                diagnostics,
-                Severity::Dropped,
-                format!("{location}#{}", parameter_data.name),
-                "header parameter",
-                "header parameters are not generated",
-            ),
-            openapiv3::Parameter::Cookie { parameter_data, .. } => record(
-                diagnostics,
-                Severity::Dropped,
-                format!("{location}#{}", parameter_data.name),
-                "cookie parameter",
-                "cookie parameters are not generated",
-            ),
-        }
-    }
-
-    if query_params.is_empty() {
-        return None;
-    }
-
-    // An operationId that yields no name falls back to the path, which always
-    // starts with the HTTP method and so always yields one.
-    let struct_name = op
-        .operation_id
-        .as_deref()
-        .and_then(to_type_ident)
-        .unwrap_or_else(|| query_name_from_path(method, path))
-        + "Query";
-
-    let mut fields = Vec::new();
-
-    for param in &query_params {
-        let data = parameter_data(param);
-        let param_path = format!("{location}#{}", data.name);
-        let openapiv3::ParameterSchemaOrContent::Schema(schema_ref) = &data.format else {
-            record(
-                diagnostics,
-                Severity::Dropped,
-                param_path,
-                "content parameter",
-                "parameter uses `content` instead of `schema`; not generated",
-            );
-            continue;
-        };
-        let (rust_type, nullable) = resolve_schema_ref(schema_ref, &param_path, diagnostics);
-
-        let default_value = match schema_ref {
-            ReferenceOr::Item(schema) => extract_default(
-                &schema.schema_data.default,
-                &rust_type,
-                false,
-                &param_path,
-                diagnostics,
-            ),
-            ReferenceOr::Reference { .. } => None,
-        };
-
-        let has_default = default_value.is_some();
-        let is_optional = if has_default {
-            nullable
-        } else {
-            !data.required || nullable
-        };
-
-        let constraints = match schema_ref {
-            ReferenceOr::Reference { .. } => Constraints::Nested,
-            ReferenceOr::Item(schema) => extract_constraints(schema),
-        };
-
-        fields.push(Field {
-            name: data.name.clone(),
-            rust_type,
-            ref_target: match schema_ref {
-                ReferenceOr::Reference { reference } => Some(reference.clone()),
-                ReferenceOr::Item(_) => None,
-            },
-            is_optional,
-            constraints,
-            default_value,
-            // Query parameters never generate inline enums.
-            is_inline_enum: false,
-        });
-    }
-
-    Some(Entity::Struct(StructDef {
-        name: struct_name,
-        kind: EntityKind::Query,
-        fields,
-        enums: Vec::new(),
-    }))
 }
 
 /// Extract validation constraints from an inline schema.
@@ -1100,74 +1234,6 @@ fn is_local_schema_ref(reference: &str) -> bool {
     reference.starts_with("#/components/schemas/")
 }
 
-/// Record a diagnostic for a `$ref` that does not point at a local component
-/// schema: the generated type name is the raw ref string and will not compile.
-fn diagnose_ref(reference: &str, context: &str, diagnostics: &mut Vec<Diagnostic>) {
-    if !is_local_schema_ref(reference) {
-        record(
-            diagnostics,
-            Severity::Degraded,
-            context.to_string(),
-            "external $ref",
-            format!(
-                "$ref `{reference}` is not a local component schema; the generated type name likely will not compile"
-            ),
-        );
-    }
-}
-
-/// Resolve a field's `ReferenceOr<Schema>` to a `(rust_type, nullable)` pair.
-fn resolve_field_type(
-    field_ref: &ReferenceOr<Box<Schema>>,
-    context: &str,
-    diagnostics: &mut Vec<Diagnostic>,
-) -> (String, bool) {
-    match field_ref {
-        ReferenceOr::Reference { reference } => {
-            diagnose_ref(reference, context, diagnostics);
-            (ref_type_name(reference, context, diagnostics), false)
-        }
-        ReferenceOr::Item(schema) => map_schema_to_type(schema, context, diagnostics),
-    }
-}
-
-/// Resolve a schema reference (used for parameters) to a `(rust_type, nullable)` pair.
-fn resolve_schema_ref(
-    schema_ref: &ReferenceOr<Schema>,
-    context: &str,
-    diagnostics: &mut Vec<Diagnostic>,
-) -> (String, bool) {
-    match schema_ref {
-        ReferenceOr::Reference { reference } => {
-            diagnose_ref(reference, context, diagnostics);
-            (ref_type_name(reference, context, diagnostics), false)
-        }
-        ReferenceOr::Item(schema) => map_schema_to_type(schema, context, diagnostics),
-    }
-}
-
-/// The Rust type a `$ref` names.
-///
-/// A reference whose target has no Rust name (`#/components/schemas/!!!`) is
-/// fatal, so the type returned here is never emitted; `serde_json::Value` just
-/// keeps the signature honest about returning a real type.
-fn ref_type_name(reference: &str, context: &str, diagnostics: &mut Vec<Diagnostic>) -> String {
-    let target = resolve_ref_name(reference);
-    match to_type_ident(&target) {
-        Some(name) => name,
-        None => {
-            record(
-                diagnostics,
-                Severity::Fatal,
-                context.to_string(),
-                "$ref",
-                format!("$ref \"{reference}\" has nothing a Rust name can be built from"),
-            );
-            "serde_json::Value".to_string()
-        }
-    }
-}
-
 /// Whether an object schema carries an `additionalProperties` that we drop
 /// (a schema value or `true`). `additionalProperties: false` carries no data.
 fn has_meaningful_additional_properties(obj: &openapiv3::ObjectType) -> bool {
@@ -1176,69 +1242,6 @@ fn has_meaningful_additional_properties(obj: &openapiv3::ObjectType) -> bool {
         Some(openapiv3::AdditionalProperties::Schema(_))
             | Some(openapiv3::AdditionalProperties::Any(true))
     )
-}
-
-/// Map an OpenAPI schema to a Rust type string and nullable flag.
-///
-/// Handles string (with date-time format), integer (i32/i64), number (f64),
-/// boolean, and array types. Falls back to `serde_json::Value` for anything
-/// else, recording a [`Severity::Degraded`] diagnostic at `context`.
-fn map_schema_to_type(
-    schema: &Schema,
-    context: &str,
-    diagnostics: &mut Vec<Diagnostic>,
-) -> (String, bool) {
-    let nullable = schema.schema_data.nullable;
-
-    match &schema.schema_kind {
-        SchemaKind::Type(Type::String(s)) => {
-            let ty = match &s.format {
-                VariantOrUnknownOrEmpty::Item(StringFormat::DateTime) => "DateTime<Utc>",
-                VariantOrUnknownOrEmpty::Item(StringFormat::Date) => "NaiveDate",
-                VariantOrUnknownOrEmpty::Unknown(f) if f == "uuid" => "Uuid",
-                _ => "String",
-            };
-            (ty.to_string(), nullable)
-        }
-        SchemaKind::Type(Type::Integer(i)) => {
-            let ty = match i.format {
-                VariantOrUnknownOrEmpty::Item(IntegerFormat::Int32) => "i32",
-                _ => "i64",
-            };
-            (ty.to_string(), nullable)
-        }
-        SchemaKind::Type(Type::Number(_)) => ("f64".to_string(), nullable),
-        SchemaKind::Type(Type::Boolean(_)) => ("bool".to_string(), nullable),
-        SchemaKind::Type(Type::Array(arr)) => {
-            let inner = match &arr.items {
-                Some(ref_or) => {
-                    let (t, _) = resolve_field_type(ref_or, context, diagnostics);
-                    t
-                }
-                None => {
-                    record(
-                        diagnostics,
-                        Severity::Degraded,
-                        context.to_string(),
-                        "array without items",
-                        "array has no `items` schema; element type is `serde_json::Value`",
-                    );
-                    "serde_json::Value".to_string()
-                }
-            };
-            (format!("Vec<{inner}>"), nullable)
-        }
-        other => {
-            record(
-                diagnostics,
-                Severity::Degraded,
-                context.to_string(),
-                describe_field_kind(other),
-                "field type is not supported; generated as `serde_json::Value`",
-            );
-            ("serde_json::Value".to_string(), nullable)
-        }
-    }
 }
 
 /// A short label for an unsupported inline field schema kind, for diagnostics.
@@ -1266,34 +1269,6 @@ fn is_supported_default(value: &serde_json::Value, rust_type: &str, is_enum: boo
         serde_json::Value::Number(_) => matches!(rust_type, "i32" | "i64" | "f64"),
         serde_json::Value::Bool(_) => rust_type == "bool",
         _ => false,
-    }
-}
-
-/// Extract and validate a default value. Returns `Some` if the default is
-/// supported, `None` otherwise. Records a diagnostic at `context` (the field's
-/// spec location) when a default is present in the spec but cannot be
-/// represented in the generated code.
-fn extract_default(
-    raw: &Option<serde_json::Value>,
-    rust_type: &str,
-    is_enum: bool,
-    context: &str,
-    diagnostics: &mut Vec<Diagnostic>,
-) -> Option<serde_json::Value> {
-    let value = raw.as_ref()?;
-    if is_supported_default(value, rust_type, is_enum) {
-        Some(value.clone())
-    } else {
-        record(
-            diagnostics,
-            Severity::Degraded,
-            context.to_string(),
-            "default value",
-            format!(
-                "default value {value} ignored (type `{rust_type}` does not support code-generated defaults)"
-            ),
-        );
-        None
     }
 }
 
