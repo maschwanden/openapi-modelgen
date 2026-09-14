@@ -1,23 +1,17 @@
 use std::fmt::Write;
 
 use crate::{
-    Config, Constraints, Entity, EntityKind, EnumDef, Field, GeneratedCrate, GeneratedFile,
-    parse::to_snake_case,
+    Config, Constraints, Diagnostic, Entity, EntityKind, EnumDef, Field, GeneratedCrate,
+    GeneratedFile, StructDef, UnionDef,
+    diagnostic::{Severity, record},
+    ident::{assert_ident, escape_keyword, to_field_ident, to_snake_case},
 };
-
-/// Rust strict keywords that must be escaped with `r#` when used as identifiers.
-const RUST_KEYWORDS: &[&str] = &[
-    "as", "async", "await", "break", "const", "continue", "crate", "dyn", "else", "enum", "extern",
-    "false", "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub",
-    "ref", "return", "self", "Self", "static", "struct", "super", "trait", "true", "type",
-    "unsafe", "use", "where", "while",
-];
 
 /// Generate a complete crate from a list of parsed entities.
 pub fn write(entities: &[Entity], config: &Config) -> Result<GeneratedCrate, std::fmt::Error> {
     let struct_fields = entities.iter().filter_map(|e| match e {
         Entity::Struct(s) => Some(s.fields.as_slice()),
-        Entity::Enum(_) => None,
+        Entity::Enum(_) | Entity::Union(_) => None,
     });
 
     let needs_regex = struct_fields.clone().any(|fields| {
@@ -36,11 +30,21 @@ pub fn write(entities: &[Entity], config: &Config) -> Result<GeneratedCrate, std
         .clone()
         .any(|fields| fields.iter().any(|f| f.rust_type == "Uuid"));
 
-    let needs_defaults = struct_fields
-        .clone()
-        .any(|fields| fields.iter().any(|f| f.default_value.is_some()));
-
     let (enum_name_map, _) = resolve_inline_enums(entities);
+
+    // Resolve every field's Rust identifier once: model.rs, default.rs and
+    // validation.rs must all spell the same field the same way.
+    let (field_idents, mut diagnostics) = resolve_field_idents(entities);
+    // Render every field default once; both model.rs and default.rs consume the
+    // result, and unrenderable defaults are reported here (a single site).
+    let (default_literals, mut default_diagnostics) =
+        compute_default_literals(entities, &enum_name_map);
+    diagnostics.append(&mut default_diagnostics);
+
+    // Keyed off the rendered literals, not off `default_value`: a default the
+    // spec declares but the writer cannot render produces no function, so
+    // emitting `default.rs` for it would leave an empty module behind.
+    let needs_defaults = !default_literals.is_empty();
 
     let mut files = vec![
         GeneratedFile {
@@ -53,26 +57,26 @@ pub fn write(entities: &[Entity], config: &Config) -> Result<GeneratedCrate, std
         },
         GeneratedFile {
             path: "src/validation.rs",
-            content: write_validation_rs(entities, needs_regex)?,
+            content: write_validation_rs(entities, needs_regex, &field_idents)?,
         },
         GeneratedFile {
             path: "src/model.rs",
-            content: write_model_rs(entities, &enum_name_map)?,
+            content: write_model_rs(entities, &enum_name_map, &default_literals, &field_idents)?,
         },
     ];
 
     if needs_defaults {
         files.push(GeneratedFile {
             path: "src/default.rs",
-            content: write_default_rs(entities, &enum_name_map)?,
+            content: write_default_rs(entities, &enum_name_map, &default_literals, &field_idents)?,
         });
     }
 
-    Ok(GeneratedCrate { files })
+    Ok(GeneratedCrate { files, diagnostics })
 }
 
 fn header_comment() -> &'static str {
-    "This file is @generated — do not edit manually."
+    "This file is @generated. Do not edit manually."
 }
 
 /// Collect deduplicated inline enum names from struct entities.
@@ -80,6 +84,151 @@ fn header_comment() -> &'static str {
 /// Returns a map from `(entity_name, raw_enum_name)` → resolved prefixed name,
 /// plus a vec of `(resolved_name, &EnumDef)` for the unique enums to emit.
 type EnumNameMap = std::collections::HashMap<(String, String), String>;
+
+/// Rust identifier for each field, keyed by `(struct name, spec field name)`.
+/// A field is absent only if its struct is, so lookups use [`field_ident`].
+type FieldIdents = std::collections::HashMap<(String, String), String>;
+
+/// Resolve the Rust identifier of every field of every struct.
+///
+/// Property names are arbitrary spec strings, so the identifier can differ from
+/// the name on the wire (`first-name` → `first_name`); `write_model_rs` emits a
+/// `#[serde(rename)]` whenever it does, which keeps the wire format intact.
+/// Sanitizing can map two properties of one struct onto a single identifier
+/// (`first-name` and `first.name`), which no naming choice resolves honestly,
+/// so that is [`Severity::Fatal`] and [`crate::generate`] fails on it.
+fn resolve_field_idents(entities: &[Entity]) -> (FieldIdents, Vec<Diagnostic>) {
+    let mut idents = FieldIdents::new();
+    let mut diagnostics = Vec::new();
+    for entity in entities {
+        let Entity::Struct(s) = entity else { continue };
+        // Field identifier → the first property that claimed it.
+        let mut taken: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        for field in &s.fields {
+            let Some(ident) = to_field_ident(&field.name) else {
+                record(
+                    &mut diagnostics,
+                    Severity::Fatal,
+                    format!("{}.{}", s.name, field.name),
+                    "property name",
+                    format!(
+                        "property name \"{}\" has nothing a Rust name can be built from",
+                        field.name
+                    ),
+                );
+                continue;
+            };
+            if let Some(first) = taken.get(&ident) {
+                record(
+                    &mut diagnostics,
+                    Severity::Fatal,
+                    format!("{}.{}", s.name, field.name),
+                    "property name",
+                    format!(
+                        "properties \"{first}\" and \"{}\" would both become \
+                         the Rust struct field `{ident}`",
+                        field.name
+                    ),
+                );
+            } else {
+                taken.insert(ident.clone(), field.name.clone());
+            }
+            idents.insert((s.name.clone(), field.name.clone()), ident);
+        }
+    }
+    (idents, diagnostics)
+}
+
+/// The Rust identifier a field is emitted with, or `None` for a property name
+/// that has none. Such a field is already reported as fatal by
+/// [`resolve_field_idents`], so the writers skip it: the run produces no files.
+fn field_ident(struct_name: &str, field: &Field, field_idents: &FieldIdents) -> Option<String> {
+    field_idents
+        .get(&(struct_name.to_string(), field.name.clone()))
+        .cloned()
+        .or_else(|| to_field_ident(&field.name))
+}
+
+/// Name of the generated `default.rs` function for a field.
+///
+/// Leading underscores are trimmed from both halves: `default__10min` would
+/// contain a double underscore and trip rustc's `non_snake_case` lint.
+fn default_fn_name(struct_name: &str, field_ident: &str) -> String {
+    let name = format!(
+        "default_{}_{}",
+        to_snake_case(struct_name).trim_start_matches('_'),
+        field_ident.trim_start_matches('_')
+    );
+    assert_ident(&name).to_string()
+}
+
+/// Escape a spec string for use inside a Rust string literal.
+fn escape_literal(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// Rendered default-value literals keyed by `(struct name, field name)`.
+/// A missing key means the field has no default, or its default could not be
+/// rendered (reported once by [`compute_default_literals`]).
+type DefaultLiterals = std::collections::HashMap<(String, String), String>;
+
+/// Render the Rust literal for every field default up front. Fields whose
+/// default cannot be represented are omitted and reported once as a Degraded
+/// diagnostic, the single source for both `model.rs` (whether to emit
+/// `#[serde(default)]`) and `default.rs` (the function body).
+fn compute_default_literals(
+    entities: &[Entity],
+    enum_name_map: &EnumNameMap,
+) -> (DefaultLiterals, Vec<Diagnostic>) {
+    let mut literals = DefaultLiterals::new();
+    let mut diagnostics = Vec::new();
+    for entity in entities {
+        let Entity::Struct(s) = entity else { continue };
+        for field in &s.fields {
+            let Some(default_val) = &field.default_value else {
+                continue;
+            };
+            // The enum the default has to name a variant of, if this is an
+            // inline enum field. `rust_type` is the enum's unprefixed name.
+            let enum_def = s.enums.iter().find(|e| e.name == field.rust_type);
+            match format_default_literal(
+                default_val,
+                field,
+                &resolved_type(&s.name, field, enum_name_map),
+                enum_def,
+            ) {
+                Some(literal) => {
+                    literals.insert((s.name.clone(), field.name.clone()), literal);
+                }
+                None => record(
+                    &mut diagnostics,
+                    Severity::Degraded,
+                    format!("{}.{}", s.name, field.name),
+                    "default value",
+                    "default value could not be rendered as a Rust literal; no `#[serde(default)]` was emitted",
+                ),
+            }
+        }
+    }
+    (literals, diagnostics)
+}
+
+/// The Rust type name a field is emitted with, before `Option` wrapping.
+///
+/// Only an inline enum needs resolving: its `rust_type` is the unprefixed enum
+/// name, which [`resolve_inline_enums`] maps to the deduplicated, struct-
+/// prefixed name. Every other `rust_type` is already a real type name and is
+/// returned untouched: looking it up in the map would rewrite a `$ref` field
+/// whose target schema happens to share an inline enum's name.
+fn resolved_type(struct_name: &str, field: &Field, enum_name_map: &EnumNameMap) -> String {
+    if !field.is_inline_enum {
+        return field.rust_type.clone();
+    }
+    enum_name_map
+        .get(&(struct_name.to_string(), field.rust_type.clone()))
+        .cloned()
+        .unwrap_or_else(|| field.rust_type.clone())
+}
 
 fn resolve_inline_enums(entities: &[Entity]) -> (EnumNameMap, Vec<(String, &EnumDef)>) {
     let mut enum_name_map: EnumNameMap = EnumNameMap::new();
@@ -113,10 +262,42 @@ fn resolve_inline_enums(entities: &[Entity]) -> (EnumNameMap, Vec<(String, &Enum
 fn write_enum(out: &mut String, name: &str, enum_def: &EnumDef) -> std::fmt::Result {
     writeln!(out)?;
     writeln!(out, "#[derive(Debug, Clone, Serialize, Deserialize)]")?;
-    writeln!(out, "pub enum {name} {{")?;
+    writeln!(out, "pub enum {} {{", assert_ident(name))?;
     for (variant, original) in &enum_def.variants {
-        writeln!(out, "    #[serde(rename = \"{original}\")]")?;
-        writeln!(out, "    {variant},")?;
+        // The variant name is sanitized (`10min` → `_10min`); the rename is what
+        // keeps the spec's value on the wire.
+        writeln!(
+            out,
+            "    #[serde(rename = \"{}\")]",
+            escape_literal(original)
+        )?;
+        writeln!(out, "    {},", assert_ident(variant))?;
+    }
+    writeln!(out, "}}")
+}
+
+/// Emit a union enum from a top-level `oneOf` schema. Internally tagged when
+/// `tag` is set (a discriminator was present), untagged otherwise.
+fn write_union(out: &mut String, union_def: &UnionDef) -> std::fmt::Result {
+    writeln!(out)?;
+    writeln!(out, "#[derive(Debug, Clone, Serialize, Deserialize)]")?;
+    match &union_def.tag {
+        Some(prop) => writeln!(out, "#[serde(tag = \"{prop}\")]")?,
+        None => writeln!(out, "#[serde(untagged)]")?,
+    }
+    writeln!(out, "pub enum {} {{", assert_ident(&union_def.name))?;
+    for variant in &union_def.variants {
+        if let Some(wire) = &variant.wire_value
+            && *wire != variant.variant_name
+        {
+            writeln!(out, "    #[serde(rename = \"{}\")]", escape_literal(wire))?;
+        }
+        writeln!(
+            out,
+            "    {}({}),",
+            assert_ident(&variant.variant_name),
+            assert_ident(&variant.inner_type)
+        )?;
     }
     writeln!(out, "}}")
 }
@@ -124,10 +305,12 @@ fn write_enum(out: &mut String, name: &str, enum_def: &EnumDef) -> std::fmt::Res
 fn write_model_rs(
     entities: &[Entity],
     enum_name_map: &EnumNameMap,
+    default_literals: &DefaultLiterals,
+    field_idents: &FieldIdents,
 ) -> Result<String, std::fmt::Error> {
     let struct_fields = entities.iter().filter_map(|e| match e {
         Entity::Struct(s) => Some(&s.fields),
-        Entity::Enum(_) => None,
+        Entity::Enum(_) | Entity::Union(_) => None,
     });
     let has_type = |ty: &str| {
         struct_fields
@@ -168,6 +351,13 @@ use serde::{{Deserialize, Serialize}};{uuid_import}
         write_enum(&mut out, enum_name, enum_def)?;
     }
 
+    // Emit unions (from top-level oneOf schemas)
+    for entity in entities {
+        if let Entity::Union(union_def) = entity {
+            write_union(&mut out, union_def)?;
+        }
+    }
+
     for entity in entities {
         let Entity::Struct(s) = entity else {
             continue;
@@ -181,27 +371,43 @@ use serde::{{Deserialize, Serialize}};{uuid_import}
                 writeln!(out, "#[derive(Debug, Clone, Deserialize)]")?;
             }
         }
-        writeln!(out, "pub struct {} {{", s.name)?;
+        // A field-less struct is reachable via an empty `properties`, or via a
+        // tagged union absorbing its only property into the tag.
+        if s.fields.is_empty() {
+            writeln!(out, "pub struct {} {{}}", assert_ident(&s.name))?;
+            continue;
+        }
+        writeln!(out, "pub struct {} {{", assert_ident(&s.name))?;
         for field in &s.fields {
-            // Resolve enum type name if this field uses a renamed enum
-            let resolved_type = enum_name_map
-                .get(&(s.name.clone(), field.rust_type.clone()))
-                .cloned()
-                .unwrap_or_else(|| field.rust_type.clone());
+            let resolved = resolved_type(&s.name, field, enum_name_map);
             let final_type = if field.is_optional {
-                format!("Option<{resolved_type}>")
+                format!("Option<{resolved}>")
             } else {
-                resolved_type
+                resolved
             };
-            if field.default_value.is_some() {
-                let struct_snake = to_snake_case(&s.name);
-                let fn_name = format!("{struct_snake}_{}", field.name);
+            let Some(ident) = field_ident(&s.name, field, field_idents) else {
+                continue;
+            };
+            // A property name that is not a usable Rust identifier is renamed;
+            // the rename keeps the spec's name on the wire. A raw identifier
+            // (`r#type`) needs none: serde already strips the `r#`.
+            if ident != field.name {
+                writeln!(
+                    out,
+                    "    #[serde(rename = \"{}\")]",
+                    escape_literal(&field.name)
+                )?;
+            }
+            // Emit the serde attribute only when a literal was rendered (so it
+            // never references a `default.rs` function that was skipped).
+            if default_literals.contains_key(&(s.name.clone(), field.name.clone())) {
+                let fn_name = default_fn_name(&s.name, &ident);
                 writeln!(out, "    #[serde(default = \"crate::default::{fn_name}\")]")?;
             }
             writeln!(
                 out,
                 "    pub {}: {final_type},",
-                escape_keyword(&field.name)
+                escape_keyword(assert_ident(&ident))
             )?;
         }
         writeln!(out, "}}")?;
@@ -210,16 +416,16 @@ use serde::{{Deserialize, Serialize}};{uuid_import}
     Ok(out)
 }
 
-/// Convert a JSON default value to a Rust literal string for the given type.
+/// Convert a JSON default value to a Rust literal string for the given field.
+/// `resolved` is the field's emitted type name (see [`resolved_type`]).
 /// Returns `None` if the combination is unsupported.
 fn format_default_literal(
     value: &serde_json::Value,
-    rust_type: &str,
-    is_optional: bool,
-    enum_name_map: &EnumNameMap,
-    struct_name: &str,
+    field: &Field,
+    resolved: &str,
+    enum_def: Option<&EnumDef>,
 ) -> Option<String> {
-    let literal = match (value, rust_type) {
+    let literal = match (value, field.rust_type.as_str()) {
         (serde_json::Value::String(s), "String") => {
             let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
             format!("String::from(\"{escaped}\")")
@@ -254,46 +460,34 @@ fn format_default_literal(
                 "Uuid::parse_str(\"{escaped}\").expect(\"hardcoded default from OpenAPI spec\")"
             )
         }
-        (serde_json::Value::String(s), enum_type) => {
-            // Inline enum: look up the resolved enum name and find the matching variant
-            let fallback = enum_type.to_string();
-            let resolved_enum = enum_name_map
-                .get(&(struct_name.to_string(), enum_type.to_string()))
-                .unwrap_or(&fallback);
-            // Find the variant that matches this default value by checking all enums
-            // The variant pair is (PascalCase, original_value)
-            let variant = find_enum_variant_for_default(s, resolved_enum, enum_name_map)?;
-            format!("{resolved_enum}::{variant}")
+        // Inline enum: the variant name is looked up rather than re-derived, so
+        // a default can never name a variant the enum does not have. `parse`
+        // has already reported a default that is not one of the enum's values.
+        (serde_json::Value::String(s), _) if field.is_inline_enum => {
+            let variant = enum_def?
+                .variants
+                .iter()
+                .find_map(|(variant, original)| (original == s).then_some(variant))?;
+            format!("{resolved}::{variant}")
         }
         _ => return None,
     };
-    if is_optional {
+    if field.is_optional {
         Some(format!("Some({literal})"))
     } else {
         Some(literal)
     }
 }
 
-/// Find the PascalCase variant name for a default string value in an enum.
-/// This is called from `format_default_literal` for inline enum fields.
-fn find_enum_variant_for_default(
-    default_str: &str,
-    _resolved_enum_name: &str,
-    _enum_name_map: &EnumNameMap,
-) -> Option<String> {
-    // Convert the default value to PascalCase to match the variant name.
-    // This works because enum variants are generated as to_pascal_case(original_value)
-    // and the original_value is what appears in the OpenAPI default.
-    Some(crate::parse::to_pascal_case(default_str))
-}
-
 fn write_default_rs(
     entities: &[Entity],
     enum_name_map: &EnumNameMap,
+    default_literals: &DefaultLiterals,
+    field_idents: &FieldIdents,
 ) -> Result<String, std::fmt::Error> {
     let struct_fields_with_name = entities.iter().filter_map(|e| match e {
         Entity::Struct(s) => Some((&s.name, &s.fields)),
-        Entity::Enum(_) => None,
+        Entity::Enum(_) | Entity::Union(_) => None,
     });
 
     // Determine which chrono/uuid imports are needed in default functions
@@ -322,11 +516,10 @@ fn write_default_rs(
     let uuid_import = if needs_uuid { "use uuid::Uuid;\n" } else { "" };
 
     // Check if any default references an enum type from model
-    let needs_model_import = struct_fields_with_name.clone().any(|(name, fields)| {
-        fields.iter().any(|f| {
-            f.default_value.is_some()
-                && enum_name_map.contains_key(&(name.clone(), f.rust_type.clone()))
-        })
+    let needs_model_import = struct_fields_with_name.clone().any(|(_, fields)| {
+        fields
+            .iter()
+            .any(|f| f.default_value.is_some() && f.is_inline_enum)
     });
     let model_import = if needs_model_import {
         "use crate::model::*;\n"
@@ -335,42 +528,34 @@ fn write_default_rs(
     };
 
     let header = header_comment();
+    // Import order matches rustfmt's alphabetical sort: chrono < crate < uuid.
     let mut out = format!(
         "\
 // {header}
 
-{chrono_import}{uuid_import}{model_import}"
+{chrono_import}{model_import}{uuid_import}"
     );
 
     for entity in entities {
         let Entity::Struct(s) = entity else {
             continue;
         };
-        let struct_snake = to_snake_case(&s.name);
         for field in &s.fields {
-            let Some(default_val) = &field.default_value else {
+            // Skip fields with no default, and those whose default could not be
+            // rendered (absent from the map, already reported in `write`).
+            let Some(literal) = default_literals.get(&(s.name.clone(), field.name.clone())) else {
                 continue;
             };
-            // Resolve the enum type name if applicable
-            let resolved_type = enum_name_map
-                .get(&(s.name.clone(), field.rust_type.clone()))
-                .cloned()
-                .unwrap_or_else(|| field.rust_type.clone());
+            let resolved = resolved_type(&s.name, field, enum_name_map);
             let return_type = if field.is_optional {
-                format!("Option<{resolved_type}>")
+                format!("Option<{resolved}>")
             } else {
-                resolved_type.clone()
+                resolved
             };
-            let Some(literal) = format_default_literal(
-                default_val,
-                &field.rust_type,
-                field.is_optional,
-                enum_name_map,
-                &s.name,
-            ) else {
+            let Some(ident) = field_ident(&s.name, field, field_idents) else {
                 continue;
             };
-            let fn_name = format!("{struct_snake}_{}", field.name);
+            let fn_name = default_fn_name(&s.name, &ident);
             writeln!(out)?;
             writeln!(out, "pub(crate) fn {fn_name}() -> {return_type} {{")?;
             writeln!(out, "    {literal}")?;
@@ -381,19 +566,23 @@ fn write_default_rs(
     Ok(out)
 }
 
-fn write_validation_rs(entities: &[Entity], needs_regex: bool) -> Result<String, std::fmt::Error> {
-    let regex_import = if needs_regex {
-        "use regex::Regex;\n"
+fn write_validation_rs(
+    entities: &[Entity],
+    needs_regex: bool,
+    field_idents: &FieldIdents,
+) -> Result<String, std::fmt::Error> {
+    // Import order matches rustfmt's alphabetical sort: crate < regex.
+    let imports = if needs_regex {
+        "use crate::model::*;\nuse regex::Regex;\n"
     } else {
-        ""
+        "use crate::model::*;\n"
     };
     let header = header_comment();
     let mut out = format!(
         "\
 // {header}
 
-{regex_import}use crate::model::*;
-
+{imports}
 #[derive(Debug)]
 pub struct ValidationError {{
     pub details: Vec<String>,
@@ -437,24 +626,31 @@ impl<T: Validation> Validation for Vec<T> {{
 
     for entity in entities {
         match entity {
-            Entity::Struct(s) => write_validation_impl(&mut out, &s.name, &s.fields)?,
+            Entity::Struct(s) => write_validation_impl(&mut out, s, field_idents)?,
             Entity::Enum(e) => {
                 writeln!(out)?;
-                writeln!(out, "impl Validation for {} {{}}", e.name)?;
+                writeln!(out, "impl Validation for {} {{}}", assert_ident(&e.name))?;
             }
+            Entity::Union(u) => write_union_validation_impl(&mut out, u)?,
         }
     }
 
     for (enum_name, _) in &inline_enums {
         writeln!(out)?;
-        writeln!(out, "impl Validation for {enum_name} {{}}")?;
+        writeln!(out, "impl Validation for {} {{}}", assert_ident(enum_name))?;
     }
 
     Ok(out)
 }
 
 /// Write the `impl Validation` block for a struct entity.
-fn write_validation_impl(out: &mut String, name: &str, fields: &[Field]) -> std::fmt::Result {
+fn write_validation_impl(
+    out: &mut String,
+    s: &StructDef,
+    field_idents: &FieldIdents,
+) -> std::fmt::Result {
+    let name = assert_ident(&s.name);
+    let fields = &s.fields;
     let has_any_checks = fields.iter().any(|f| f.constraints.has_checks());
 
     writeln!(out)?;
@@ -476,7 +672,10 @@ fn write_validation_impl(out: &mut String, name: &str, fields: &[Field]) -> std:
         if !field.constraints.has_checks() {
             continue;
         }
-        write_field_checks(out, field)?;
+        let Some(ident) = field_ident(&s.name, field, field_idents) else {
+            continue;
+        };
+        write_field_checks(out, field, &ident)?;
     }
 
     writeln!(out, "        if errors.is_empty() {{")?;
@@ -492,6 +691,40 @@ fn write_validation_impl(out: &mut String, name: &str, fields: &[Field]) -> std:
     Ok(())
 }
 
+/// Write the `impl Validation` block for a union entity, delegating to the
+/// active variant's inner `validate()`.
+fn write_union_validation_impl(out: &mut String, union_def: &UnionDef) -> std::fmt::Result {
+    writeln!(out)?;
+    if union_def.variants.is_empty() {
+        writeln!(
+            out,
+            "impl Validation for {} {{}}",
+            assert_ident(&union_def.name)
+        )?;
+        return Ok(());
+    }
+    writeln!(
+        out,
+        "impl Validation for {} {{",
+        assert_ident(&union_def.name)
+    )?;
+    writeln!(
+        out,
+        "    fn validate(&self) -> Result<(), ValidationError> {{"
+    )?;
+    writeln!(out, "        match self {{")?;
+    for variant in &union_def.variants {
+        writeln!(
+            out,
+            "            Self::{}(inner) => inner.validate(),",
+            assert_ident(&variant.variant_name)
+        )?;
+    }
+    writeln!(out, "        }}")?;
+    writeln!(out, "    }}")?;
+    writeln!(out, "}}")
+}
+
 /// Write `errors.push(format!("...", args));` across multiple lines for readability.
 fn write_error_push(out: &mut String, indent: &str, fmt_str: &str, args: &str) -> std::fmt::Result {
     writeln!(out, "{indent}    errors.push(format!(")?;
@@ -503,7 +736,7 @@ fn write_error_push(out: &mut String, indent: &str, fmt_str: &str, args: &str) -
 /// Returns true when this constraint produces exactly one `if`-style check that
 /// clippy would flag as collapsible with an outer `if let Some`.
 fn is_single_collapsible_check(constraints: &Constraints) -> bool {
-    // VecNested emits a `for` loop, Array unique_items emits a block — neither is collapsible.
+    // VecNested emits a `for` loop, Array unique_items emits a block; neither is collapsible.
     let non_collapsible = matches!(constraints, Constraints::VecNested)
         || matches!(
             constraints,
@@ -535,9 +768,11 @@ fn write_check_open(
 }
 
 /// Write the validation checks for a single field inside a `validate()` body.
-fn write_field_checks(out: &mut String, field: &Field) -> std::fmt::Result {
+fn write_field_checks(out: &mut String, field: &Field, ident: &str) -> std::fmt::Result {
+    // The spec's property name is what error messages report; `ident` is how the
+    // field is spelled in Rust, and the two differ for a sanitized name.
     let name = &field.name;
-    let field_ident = escape_keyword(name);
+    let field_ident = escape_keyword(assert_ident(ident));
 
     let collapsed = field.is_optional && is_single_collapsible_check(&field.constraints);
 
@@ -609,10 +844,15 @@ fn write_field_checks(out: &mut String, field: &Field) -> std::fmt::Result {
                     &format!("!Regex::new(\"{escaped}\").unwrap().is_match(&{accessor})"),
                     guard.as_deref(),
                 )?;
+                // The message is a `format!` string literal, so any `{`/`}` in the
+                // pattern (e.g. brace quantifiers like `{1,14}`) must be doubled to
+                // avoid being parsed as format placeholders. The `Regex::new` arg
+                // above must keep the un-doubled braces.
+                let escaped_msg = escaped.replace('{', "{{").replace('}', "}}");
                 write_error_push(
                     out,
                     indent,
-                    &format!("\"{name}: value '{{}}' does not match pattern '{escaped}'\""),
+                    &format!("\"{name}: value '{{}}' does not match pattern '{escaped_msg}'\""),
                     &accessor,
                 )?;
                 writeln!(out, "{indent}}}")?;
@@ -991,14 +1231,6 @@ pub use validation::{{Validation, ValidationError}};
 }
 
 /// Escape a name with `r#` if it is a Rust keyword.
-fn escape_keyword(name: &str) -> String {
-    if RUST_KEYWORDS.contains(&name) {
-        format!("r#{name}")
-    } else {
-        name.to_string()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1038,6 +1270,8 @@ mod tests {
             is_optional: false,
             constraints,
             default_value: None,
+            ref_target: None,
+            is_inline_enum: false,
         }
     }
 
@@ -1060,11 +1294,52 @@ mod tests {
         let krate = write(&[entity], &test_config())?;
         let v = find_file(&krate, "src/validation.rs");
         assert!(v.contains("Regex::new("), "missing Regex::new: {v}");
-        assert!(v.contains("use regex::Regex;"), "missing regex import: {v}");
+        // Imports are emitted in the order rustfmt sorts them, so running
+        // rustfmt over the output does not reshuffle them.
+        assert!(
+            v.contains("use crate::model::*;\nuse regex::Regex;\n\n#[derive(Debug)]"),
+            "imports should be sorted with exactly one blank line after: {v}"
+        );
         let cargo = find_file(&krate, "Cargo.toml");
         assert!(
             cargo.contains("regex.workspace = true"),
             "missing regex dep: {cargo}"
+        );
+
+        Ok(())
+    }
+
+    /// A `pattern` containing brace quantifiers (e.g. `{1,14}`) must have its
+    /// braces doubled in the `format!` error-message literal, but NOT in the
+    /// `Regex::new(...)` argument, where doubling would corrupt the regex.
+    #[test]
+    fn write_pattern_with_brace_quantifier() -> Result {
+        let entity = single_field_entity(
+            "Foo",
+            EntityKind::Schema,
+            required_field(
+                "phone",
+                "String",
+                Constraints::String {
+                    min_length: None,
+                    max_length: None,
+                    pattern: Some(r"^\+[1-9]\d{1,14}$".into()),
+                    enumeration: vec![],
+                },
+            ),
+        );
+        let krate = write(&[entity], &test_config())?;
+        let v = find_file(&krate, "src/validation.rs");
+
+        // Regex::new argument keeps the un-doubled braces (a valid regex).
+        assert!(
+            v.contains(r#"Regex::new("^\\+[1-9]\\d{1,14}$")"#),
+            "regex arg should keep un-doubled braces: {v}"
+        );
+        // The error-message format literal doubles the braces.
+        assert!(
+            v.contains(r#"does not match pattern '^\\+[1-9]\\d{{1,14}}$'"#),
+            "message literal should double the braces: {v}"
         );
 
         Ok(())
@@ -1086,6 +1361,8 @@ mod tests {
                     enumeration: vec![],
                 },
                 default_value: None,
+                ref_target: None,
+                is_inline_enum: false,
             },
         );
         let krate = write(&[entity], &test_config())?;
