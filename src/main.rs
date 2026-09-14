@@ -127,7 +127,10 @@ fn report_diagnostics(diagnostics: &[openapi_modelgen::Diagnostic]) {
         .iter()
         .filter(|d| d.severity == Severity::Dropped)
         .count();
-    let degraded = diagnostics.len() - dropped;
+    let degraded = diagnostics
+        .iter()
+        .filter(|d| d.severity == Severity::Degraded)
+        .count();
     eprintln!(
         "warning: {} spec construct(s) were not fully generated ({dropped} dropped, {degraded} degraded):",
         diagnostics.len()

@@ -16,6 +16,10 @@ pub enum Severity {
     /// The construct produced a lossy fallback (e.g. an inline object field
     /// degraded to `serde_json::Value`).
     Degraded,
+    /// The construct cannot produce any meaningful value and has no fallback
+    /// available (e.g. two spec names that map to one Rust name, or a name with
+    /// nothing to build one from).
+    Fatal,
 }
 
 impl Severity {
@@ -24,7 +28,13 @@ impl Severity {
         match self {
             Severity::Dropped => "dropped",
             Severity::Degraded => "degraded",
+            Severity::Fatal => "fatal",
         }
+    }
+
+    /// Whether this severity aborts generation.
+    pub fn is_fatal(self) -> bool {
+        matches!(self, Severity::Fatal)
     }
 }
 

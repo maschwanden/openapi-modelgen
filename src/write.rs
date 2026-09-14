@@ -2,18 +2,10 @@ use std::fmt::Write;
 
 use crate::{
     Config, Constraints, Diagnostic, Entity, EntityKind, EnumDef, Field, GeneratedCrate,
-    GeneratedFile, UnionDef,
+    GeneratedFile, StructDef, UnionDef,
     diagnostic::{Severity, record},
-    parse::to_snake_case,
+    ident::{assert_ident, escape_keyword, to_field_ident, to_snake_case},
 };
-
-/// Rust strict keywords that must be escaped with `r#` when used as identifiers.
-const RUST_KEYWORDS: &[&str] = &[
-    "as", "async", "await", "break", "const", "continue", "crate", "dyn", "else", "enum", "extern",
-    "false", "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub",
-    "ref", "return", "self", "Self", "static", "struct", "super", "trait", "true", "type",
-    "unsafe", "use", "where", "while",
-];
 
 /// Generate a complete crate from a list of parsed entities.
 pub fn write(entities: &[Entity], config: &Config) -> Result<GeneratedCrate, std::fmt::Error> {
@@ -41,6 +33,9 @@ pub fn write(entities: &[Entity], config: &Config) -> Result<GeneratedCrate, std
     let (enum_name_map, _) = resolve_inline_enums(entities);
 
     let mut diagnostics = Vec::new();
+    // Resolve every field's Rust identifier once: model.rs, default.rs and
+    // validation.rs must all spell the same field the same way.
+    let field_idents = resolve_field_idents(entities, &mut diagnostics);
     // Render every field default once; both model.rs and default.rs consume the
     // result, and unrenderable defaults are reported here (a single site).
     let default_literals = compute_default_literals(entities, &enum_name_map, &mut diagnostics);
@@ -61,18 +56,18 @@ pub fn write(entities: &[Entity], config: &Config) -> Result<GeneratedCrate, std
         },
         GeneratedFile {
             path: "src/validation.rs",
-            content: write_validation_rs(entities, needs_regex)?,
+            content: write_validation_rs(entities, needs_regex, &field_idents)?,
         },
         GeneratedFile {
             path: "src/model.rs",
-            content: write_model_rs(entities, &enum_name_map, &default_literals)?,
+            content: write_model_rs(entities, &enum_name_map, &default_literals, &field_idents)?,
         },
     ];
 
     if needs_defaults {
         files.push(GeneratedFile {
             path: "src/default.rs",
-            content: write_default_rs(entities, &enum_name_map, &default_literals)?,
+            content: write_default_rs(entities, &enum_name_map, &default_literals, &field_idents)?,
         });
     }
 
@@ -88,6 +83,86 @@ fn header_comment() -> &'static str {
 /// Returns a map from `(entity_name, raw_enum_name)` → resolved prefixed name,
 /// plus a vec of `(resolved_name, &EnumDef)` for the unique enums to emit.
 type EnumNameMap = std::collections::HashMap<(String, String), String>;
+
+/// Rust identifier for each field, keyed by `(struct name, spec field name)`.
+/// A field is absent only if its struct is, so lookups use [`field_ident`].
+type FieldIdents = std::collections::HashMap<(String, String), String>;
+
+/// Resolve the Rust identifier of every field of every struct.
+///
+/// Property names are arbitrary spec strings, so the identifier can differ from
+/// the name on the wire (`first-name` → `first_name`); `write_model_rs` emits a
+/// `#[serde(rename)]` whenever it does, which keeps the wire format intact.
+/// Sanitizing can map two properties of one struct onto a single identifier
+/// (`first-name` and `first.name`), which no naming choice resolves honestly,
+/// so that is [`Severity::Fatal`] and [`crate::generate`] fails on it.
+fn resolve_field_idents(entities: &[Entity], diagnostics: &mut Vec<Diagnostic>) -> FieldIdents {
+    let mut idents = FieldIdents::new();
+    for entity in entities {
+        let Entity::Struct(s) = entity else { continue };
+        // Field identifier → the first property that claimed it.
+        let mut taken: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        for field in &s.fields {
+            let Some(ident) = to_field_ident(&field.name) else {
+                record(
+                    diagnostics,
+                    Severity::Fatal,
+                    format!("{}.{}", s.name, field.name),
+                    "property name",
+                    format!(
+                        "property name \"{}\" has nothing a Rust name can be built from",
+                        field.name
+                    ),
+                );
+                continue;
+            };
+            if let Some(first) = taken.get(&ident) {
+                record(
+                    diagnostics,
+                    Severity::Fatal,
+                    format!("{}.{}", s.name, field.name),
+                    "property name",
+                    format!(
+                        "properties \"{first}\" and \"{}\" would both become \
+                         the Rust struct field `{ident}`",
+                        field.name
+                    ),
+                );
+            } else {
+                taken.insert(ident.clone(), field.name.clone());
+            }
+            idents.insert((s.name.clone(), field.name.clone()), ident);
+        }
+    }
+    idents
+}
+
+/// The Rust identifier a field is emitted with, or `None` for a property name
+/// that has none. Such a field is already reported as fatal by
+/// [`resolve_field_idents`], so the writers skip it: the run produces no files.
+fn field_ident(struct_name: &str, field: &Field, field_idents: &FieldIdents) -> Option<String> {
+    field_idents
+        .get(&(struct_name.to_string(), field.name.clone()))
+        .cloned()
+        .or_else(|| to_field_ident(&field.name))
+}
+
+/// Name of the generated `default.rs` function for a field.
+///
+/// Leading underscores are trimmed from both halves: `default__10min` would
+/// contain a double underscore and trip rustc's `non_snake_case` lint.
+fn default_fn_name(struct_name: &str, field_ident: &str) -> String {
+    format!(
+        "default_{}_{}",
+        to_snake_case(struct_name).trim_start_matches('_'),
+        field_ident.trim_start_matches('_')
+    )
+}
+
+/// Escape a spec string for use inside a Rust string literal.
+fn escape_literal(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
 
 /// Rendered default-value literals keyed by `(struct name, field name)`.
 /// A missing key means the field has no default, or its default could not be
@@ -110,10 +185,14 @@ fn compute_default_literals(
             let Some(default_val) = &field.default_value else {
                 continue;
             };
+            // The enum the default has to name a variant of, if this is an
+            // inline enum field. `rust_type` is the enum's unprefixed name.
+            let enum_def = s.enums.iter().find(|e| e.name == field.rust_type);
             match format_default_literal(
                 default_val,
                 field,
                 &resolved_type(&s.name, field, enum_name_map),
+                enum_def,
             ) {
                 Some(literal) => {
                     literals.insert((s.name.clone(), field.name.clone()), literal);
@@ -180,10 +259,16 @@ fn resolve_inline_enums(entities: &[Entity]) -> (EnumNameMap, Vec<(String, &Enum
 fn write_enum(out: &mut String, name: &str, enum_def: &EnumDef) -> std::fmt::Result {
     writeln!(out)?;
     writeln!(out, "#[derive(Debug, Clone, Serialize, Deserialize)]")?;
-    writeln!(out, "pub enum {name} {{")?;
+    writeln!(out, "pub enum {} {{", assert_ident(name))?;
     for (variant, original) in &enum_def.variants {
-        writeln!(out, "    #[serde(rename = \"{original}\")]")?;
-        writeln!(out, "    {variant},")?;
+        // The variant name is sanitized (`10min` → `_10min`); the rename is what
+        // keeps the spec's value on the wire.
+        writeln!(
+            out,
+            "    #[serde(rename = \"{}\")]",
+            escape_literal(original)
+        )?;
+        writeln!(out, "    {},", assert_ident(variant))?;
     }
     writeln!(out, "}}")
 }
@@ -197,14 +282,19 @@ fn write_union(out: &mut String, union_def: &UnionDef) -> std::fmt::Result {
         Some(prop) => writeln!(out, "#[serde(tag = \"{prop}\")]")?,
         None => writeln!(out, "#[serde(untagged)]")?,
     }
-    writeln!(out, "pub enum {} {{", union_def.name)?;
+    writeln!(out, "pub enum {} {{", assert_ident(&union_def.name))?;
     for variant in &union_def.variants {
         if let Some(wire) = &variant.wire_value
             && *wire != variant.variant_name
         {
-            writeln!(out, "    #[serde(rename = \"{wire}\")]")?;
+            writeln!(out, "    #[serde(rename = \"{}\")]", escape_literal(wire))?;
         }
-        writeln!(out, "    {}({}),", variant.variant_name, variant.inner_type)?;
+        writeln!(
+            out,
+            "    {}({}),",
+            assert_ident(&variant.variant_name),
+            assert_ident(&variant.inner_type)
+        )?;
     }
     writeln!(out, "}}")
 }
@@ -213,6 +303,7 @@ fn write_model_rs(
     entities: &[Entity],
     enum_name_map: &EnumNameMap,
     default_literals: &DefaultLiterals,
+    field_idents: &FieldIdents,
 ) -> Result<String, std::fmt::Error> {
     let struct_fields = entities.iter().filter_map(|e| match e {
         Entity::Struct(s) => Some(&s.fields),
@@ -280,10 +371,10 @@ use serde::{{Deserialize, Serialize}};{uuid_import}
         // A field-less struct is reachable via an empty `properties`, or via a
         // tagged union absorbing its only property into the tag.
         if s.fields.is_empty() {
-            writeln!(out, "pub struct {} {{}}", s.name)?;
+            writeln!(out, "pub struct {} {{}}", assert_ident(&s.name))?;
             continue;
         }
-        writeln!(out, "pub struct {} {{", s.name)?;
+        writeln!(out, "pub struct {} {{", assert_ident(&s.name))?;
         for field in &s.fields {
             let resolved = resolved_type(&s.name, field, enum_name_map);
             let final_type = if field.is_optional {
@@ -291,17 +382,29 @@ use serde::{{Deserialize, Serialize}};{uuid_import}
             } else {
                 resolved
             };
+            let Some(ident) = field_ident(&s.name, field, field_idents) else {
+                continue;
+            };
+            // A property name that is not a usable Rust identifier is renamed;
+            // the rename keeps the spec's name on the wire. A raw identifier
+            // (`r#type`) needs none: serde already strips the `r#`.
+            if ident != field.name {
+                writeln!(
+                    out,
+                    "    #[serde(rename = \"{}\")]",
+                    escape_literal(&field.name)
+                )?;
+            }
             // Emit the serde attribute only when a literal was rendered (so it
             // never references a `default.rs` function that was skipped).
             if default_literals.contains_key(&(s.name.clone(), field.name.clone())) {
-                let struct_snake = to_snake_case(&s.name);
-                let fn_name = format!("default_{struct_snake}_{}", field.name);
+                let fn_name = default_fn_name(&s.name, &ident);
                 writeln!(out, "    #[serde(default = \"crate::default::{fn_name}\")]")?;
             }
             writeln!(
                 out,
                 "    pub {}: {final_type},",
-                escape_keyword(&field.name)
+                escape_keyword(assert_ident(&ident))
             )?;
         }
         writeln!(out, "}}")?;
@@ -317,6 +420,7 @@ fn format_default_literal(
     value: &serde_json::Value,
     field: &Field,
     resolved: &str,
+    enum_def: Option<&EnumDef>,
 ) -> Option<String> {
     let literal = match (value, field.rust_type.as_str()) {
         (serde_json::Value::String(s), "String") => {
@@ -353,10 +457,15 @@ fn format_default_literal(
                 "Uuid::parse_str(\"{escaped}\").expect(\"hardcoded default from OpenAPI spec\")"
             )
         }
-        // Inline enum: variants are generated as `to_pascal_case(value)`, and
-        // `parse` has already checked that the default names one of them.
+        // Inline enum: the variant name is looked up rather than re-derived, so
+        // a default can never name a variant the enum does not have. `parse`
+        // has already reported a default that is not one of the enum's values.
         (serde_json::Value::String(s), _) if field.is_inline_enum => {
-            format!("{resolved}::{}", crate::parse::to_pascal_case(s))
+            let variant = enum_def?
+                .variants
+                .iter()
+                .find_map(|(variant, original)| (original == s).then_some(variant))?;
+            format!("{resolved}::{variant}")
         }
         _ => return None,
     };
@@ -371,6 +480,7 @@ fn write_default_rs(
     entities: &[Entity],
     enum_name_map: &EnumNameMap,
     default_literals: &DefaultLiterals,
+    field_idents: &FieldIdents,
 ) -> Result<String, std::fmt::Error> {
     let struct_fields_with_name = entities.iter().filter_map(|e| match e {
         Entity::Struct(s) => Some((&s.name, &s.fields)),
@@ -427,7 +537,6 @@ fn write_default_rs(
         let Entity::Struct(s) = entity else {
             continue;
         };
-        let struct_snake = to_snake_case(&s.name);
         for field in &s.fields {
             // Skip fields with no default, and those whose default could not be
             // rendered (absent from the map — already reported in `write`).
@@ -440,7 +549,10 @@ fn write_default_rs(
             } else {
                 resolved
             };
-            let fn_name = format!("default_{struct_snake}_{}", field.name);
+            let Some(ident) = field_ident(&s.name, field, field_idents) else {
+                continue;
+            };
+            let fn_name = default_fn_name(&s.name, &ident);
             writeln!(out)?;
             writeln!(out, "pub(crate) fn {fn_name}() -> {return_type} {{")?;
             writeln!(out, "    {literal}")?;
@@ -451,7 +563,11 @@ fn write_default_rs(
     Ok(out)
 }
 
-fn write_validation_rs(entities: &[Entity], needs_regex: bool) -> Result<String, std::fmt::Error> {
+fn write_validation_rs(
+    entities: &[Entity],
+    needs_regex: bool,
+    field_idents: &FieldIdents,
+) -> Result<String, std::fmt::Error> {
     // Import order matches rustfmt's alphabetical sort: crate < regex.
     let imports = if needs_regex {
         "use crate::model::*;\nuse regex::Regex;\n"
@@ -507,10 +623,10 @@ impl<T: Validation> Validation for Vec<T> {{
 
     for entity in entities {
         match entity {
-            Entity::Struct(s) => write_validation_impl(&mut out, &s.name, &s.fields)?,
+            Entity::Struct(s) => write_validation_impl(&mut out, s, field_idents)?,
             Entity::Enum(e) => {
                 writeln!(out)?;
-                writeln!(out, "impl Validation for {} {{}}", e.name)?;
+                writeln!(out, "impl Validation for {} {{}}", assert_ident(&e.name))?;
             }
             Entity::Union(u) => write_union_validation_impl(&mut out, u)?,
         }
@@ -518,14 +634,20 @@ impl<T: Validation> Validation for Vec<T> {{
 
     for (enum_name, _) in &inline_enums {
         writeln!(out)?;
-        writeln!(out, "impl Validation for {enum_name} {{}}")?;
+        writeln!(out, "impl Validation for {} {{}}", assert_ident(enum_name))?;
     }
 
     Ok(out)
 }
 
 /// Write the `impl Validation` block for a struct entity.
-fn write_validation_impl(out: &mut String, name: &str, fields: &[Field]) -> std::fmt::Result {
+fn write_validation_impl(
+    out: &mut String,
+    s: &StructDef,
+    field_idents: &FieldIdents,
+) -> std::fmt::Result {
+    let name = assert_ident(&s.name);
+    let fields = &s.fields;
     let has_any_checks = fields.iter().any(|f| f.constraints.has_checks());
 
     writeln!(out)?;
@@ -547,7 +669,10 @@ fn write_validation_impl(out: &mut String, name: &str, fields: &[Field]) -> std:
         if !field.constraints.has_checks() {
             continue;
         }
-        write_field_checks(out, field)?;
+        let Some(ident) = field_ident(&s.name, field, field_idents) else {
+            continue;
+        };
+        write_field_checks(out, field, &ident)?;
     }
 
     writeln!(out, "        if errors.is_empty() {{")?;
@@ -568,10 +693,18 @@ fn write_validation_impl(out: &mut String, name: &str, fields: &[Field]) -> std:
 fn write_union_validation_impl(out: &mut String, union_def: &UnionDef) -> std::fmt::Result {
     writeln!(out)?;
     if union_def.variants.is_empty() {
-        writeln!(out, "impl Validation for {} {{}}", union_def.name)?;
+        writeln!(
+            out,
+            "impl Validation for {} {{}}",
+            assert_ident(&union_def.name)
+        )?;
         return Ok(());
     }
-    writeln!(out, "impl Validation for {} {{", union_def.name)?;
+    writeln!(
+        out,
+        "impl Validation for {} {{",
+        assert_ident(&union_def.name)
+    )?;
     writeln!(
         out,
         "    fn validate(&self) -> Result<(), ValidationError> {{"
@@ -581,7 +714,7 @@ fn write_union_validation_impl(out: &mut String, union_def: &UnionDef) -> std::f
         writeln!(
             out,
             "            Self::{}(inner) => inner.validate(),",
-            variant.variant_name
+            assert_ident(&variant.variant_name)
         )?;
     }
     writeln!(out, "        }}")?;
@@ -632,9 +765,11 @@ fn write_check_open(
 }
 
 /// Write the validation checks for a single field inside a `validate()` body.
-fn write_field_checks(out: &mut String, field: &Field) -> std::fmt::Result {
+fn write_field_checks(out: &mut String, field: &Field, ident: &str) -> std::fmt::Result {
+    // The spec's property name is what error messages report; `ident` is how the
+    // field is spelled in Rust, and the two differ for a sanitized name.
     let name = &field.name;
-    let field_ident = escape_keyword(name);
+    let field_ident = escape_keyword(assert_ident(ident));
 
     let collapsed = field.is_optional && is_single_collapsible_check(&field.constraints);
 
@@ -1093,14 +1228,6 @@ pub use validation::{{Validation, ValidationError}};
 }
 
 /// Escape a name with `r#` if it is a Rust keyword.
-fn escape_keyword(name: &str) -> String {
-    if RUST_KEYWORDS.contains(&name) {
-        format!("r#{name}")
-    } else {
-        name.to_string()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1140,6 +1267,7 @@ mod tests {
             is_optional: false,
             constraints,
             default_value: None,
+            ref_target: None,
             is_inline_enum: false,
         }
     }
@@ -1230,6 +1358,7 @@ mod tests {
                     enumeration: vec![],
                 },
                 default_value: None,
+                ref_target: None,
                 is_inline_enum: false,
             },
         );

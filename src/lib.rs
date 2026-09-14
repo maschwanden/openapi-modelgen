@@ -7,6 +7,7 @@
 
 mod diagnostic;
 mod error;
+mod ident;
 mod parse;
 mod write;
 
@@ -58,6 +59,9 @@ pub struct Field {
     pub constraints: Constraints,
     /// Default value from the OpenAPI schema, if present and supported.
     pub default_value: Option<serde_json::Value>,
+    /// The `$ref` this field's type came from, when it came from one directly.
+    /// Kept so a reference that resolves to nothing can be named in full.
+    pub ref_target: Option<String>,
     /// Whether `rust_type` names an enum declared inline on this field, which
     /// the writer renames to keep it unique (`Language` becomes
     /// `GreetingLanguage`). A `$ref` field can carry that same name, so the
@@ -289,6 +293,20 @@ pub fn generate(spec: &OpenAPI, config: &Config) -> Result<GeneratedCrate> {
     // Parse-time diagnostics come first (spec order), then write-time ones.
     diagnostics.append(&mut generated.diagnostics);
     generated.diagnostics = diagnostics;
+
+    // A fatal diagnostic means two spec names want one Rust name. Every other
+    // diagnostic describes output the caller can still use; this one does not,
+    // and no choice here would be better than the spec being fixed.
+    let problems: Vec<Diagnostic> = generated
+        .diagnostics
+        .iter()
+        .filter(|d| d.severity.is_fatal())
+        .cloned()
+        .collect();
+    if !problems.is_empty() {
+        return Err(error::Error::Unrepresentable(problems));
+    }
+
     Ok(generated)
 }
 
@@ -305,6 +323,19 @@ mod tests {
             crate_name: "test_api".to_string(),
             use_workspace: true,
         }
+    }
+
+    /// Generate, expecting a fatal problem, and return the rendered error.
+    fn spec_error(yaml: &str) -> String {
+        let spec = load_spec(yaml).expect("spec should parse");
+        let Err(err) = generate(&spec, &test_config()) else {
+            panic!("generation should have been aborted");
+        };
+        assert!(
+            matches!(err, error::Error::Unrepresentable(_)),
+            "expected a name collision, got {err}"
+        );
+        err.to_string()
     }
 
     fn file_content<'a>(crate_: &'a GeneratedCrate, path: &str) -> &'a str {
@@ -1254,6 +1285,660 @@ components:
             crate_.diagnostics.is_empty(),
             "expected no diagnostics, got {:?}",
             crate_.diagnostics
+        );
+
+        Ok(())
+    }
+
+    /// Enum values are arbitrary spec strings: they start with digits or carry
+    /// punctuation. Each has to become a legal variant, with the value itself
+    /// preserved by a `#[serde(rename)]`.
+    #[test]
+    fn enum_values_that_are_not_identifiers() -> Result<()> {
+        let yaml = r#"
+openapi: "3.0.3"
+info:
+  title: Test
+  version: "0.1.0"
+paths: {}
+components:
+  schemas:
+    Series:
+      type: object
+      properties:
+        resolution:
+          type: string
+          enum: ["10min", "1h", "P1D", "with space", "x/y", "self"]
+"#;
+        let crate_ = generate(&load_spec(yaml)?, &test_config())?;
+        let model = file_content(&crate_, "src/model.rs");
+
+        for (value, variant) in [
+            ("10min", "Variant10min"),
+            ("1h", "Variant1h"),
+            ("P1D", "P1D"),
+            ("with space", "WithSpace"),
+            ("x/y", "XY"),
+            // `Self` cannot be written as a raw identifier.
+            ("self", "Self_"),
+        ] {
+            assert!(
+                model.contains(&format!(
+                    "    #[serde(rename = \"{value}\")]\n    {variant},\n"
+                )),
+                "value {value:?} should become variant {variant}: {model}"
+            );
+        }
+
+        // Sanitizing loses nothing: the wire value survives in the rename.
+        assert!(
+            crate_.diagnostics.is_empty(),
+            "expected no diagnostics, got {:?}",
+            crate_.diagnostics
+        );
+
+        Ok(())
+    }
+
+    /// Two values that sanitize to the same variant have no honest resolution:
+    /// dropping one makes it undeserializable, suffixing one puts a variant in
+    /// the API that appears nowhere in the spec. Generation fails instead.
+    #[test]
+    fn colliding_enum_values_abort() -> Result<()> {
+        let yaml = r#"
+openapi: "3.0.3"
+info:
+  title: Test
+  version: "0.1.0"
+paths: {}
+components:
+  schemas:
+    Series:
+      type: object
+      properties:
+        kind:
+          type: string
+          enum: ["a.b", "a-b"]
+"#;
+        let message = spec_error(yaml);
+        assert!(
+            message.contains(
+                r#"enum values "a.b" and "a-b" would both become the Rust enum variant `AB`"#
+            ),
+            "the error should name both values: {message}"
+        );
+        assert!(
+            message.contains("Series.kind"),
+            "the error should point at the spec location: {message}"
+        );
+        assert!(
+            message.contains("Fix the spec"),
+            "the error should say what to do: {message}"
+        );
+
+        Ok(())
+    }
+
+    /// The `Variant` prefix is a plain string, so a value needing it can land on a
+    /// value that spells it out. That is the same clash as `a.b` vs `a-b`, and
+    /// it aborts the same way.
+    #[test]
+    fn a_prefixed_variant_colliding_with_a_spelled_out_value_aborts() -> Result<()> {
+        let yaml = r#"
+openapi: "3.0.3"
+info:
+  title: Test
+  version: "0.1.0"
+paths: {}
+components:
+  schemas:
+    Series:
+      type: object
+      properties:
+        resolution:
+          type: string
+          enum: ["10min", "Variant10min"]
+"#;
+        let message = spec_error(yaml);
+        assert!(
+            message.contains(
+                r#"enum values "10min" and "Variant10min" would both become the Rust enum variant `Variant10min`"#
+            ),
+            "the error should name both values: {message}"
+        );
+
+        Ok(())
+    }
+
+    /// A value listed twice would emit two variants renamed to the same string,
+    /// which serde rejects at compile time.
+    #[test]
+    fn repeated_enum_value_is_dropped() -> Result<()> {
+        let yaml = r#"
+openapi: "3.0.3"
+info:
+  title: Test
+  version: "0.1.0"
+paths: {}
+components:
+  schemas:
+    Series:
+      type: object
+      properties:
+        kind:
+          type: string
+          enum: ["a", "a"]
+"#;
+        let crate_ = generate(&load_spec(yaml)?, &test_config())?;
+        let model = file_content(&crate_, "src/model.rs");
+
+        assert_eq!(
+            model.matches(r#"#[serde(rename = "a")]"#).count(),
+            1,
+            "the repeated value should be emitted once: {model}"
+        );
+        assert!(
+            crate_
+                .diagnostics
+                .iter()
+                .any(|d| d.severity == Severity::Dropped && d.reason.contains("listed twice")),
+            "the repeat should be reported: {:?}",
+            crate_.diagnostics
+        );
+
+        Ok(())
+    }
+
+    /// The default is resolved through the enum's own variant list rather than
+    /// re-derived from the string, so a sanitized value still resolves, and a
+    /// change to variant naming cannot leave the default naming a variant that
+    /// does not exist.
+    #[test]
+    fn inline_enum_default_uses_the_sanitized_variant() -> Result<()> {
+        let yaml = r#"
+openapi: "3.0.3"
+info:
+  title: Test
+  version: "0.1.0"
+paths: {}
+components:
+  schemas:
+    Series:
+      type: object
+      properties:
+        resolution:
+          type: string
+          enum: ["10min", "1h"]
+          default: "1h"
+"#;
+        let crate_ = generate(&load_spec(yaml)?, &test_config())?;
+        let defaults = file_content(&crate_, "src/default.rs");
+
+        assert!(
+            defaults.contains("SeriesResolution::Variant1h"),
+            "default should name the sanitized variant: {defaults}"
+        );
+
+        Ok(())
+    }
+
+    /// Property names are spec strings too. An unusable one is sanitized into a
+    /// field identifier and renamed back on the wire; everything derived from
+    /// the field (default function, validation accessor) follows the
+    /// identifier, while messages keep the spec's name.
+    #[test]
+    fn property_names_that_are_not_identifiers() -> Result<()> {
+        let yaml = r#"
+openapi: "3.0.3"
+info:
+  title: Test
+  version: "0.1.0"
+paths: {}
+components:
+  schemas:
+    Series:
+      type: object
+      properties:
+        "10min":
+          type: string
+          default: "x"
+        "first-name":
+          type: string
+          maxLength: 5
+        "self":
+          type: string
+        "type":
+          type: string
+"#;
+        let crate_ = generate(&load_spec(yaml)?, &test_config())?;
+        let model = file_content(&crate_, "src/model.rs");
+
+        assert!(
+            model.contains("    #[serde(rename = \"first-name\")]\n"),
+            "a renamed field needs the wire name back: {model}"
+        );
+        assert!(
+            model.contains("    pub first_name: Option<String>,"),
+            "`first-name` should become `first_name`: {model}"
+        );
+        assert!(
+            model.contains("    pub _10min: String,"),
+            "a leading digit should be prefixed: {model}"
+        );
+        assert!(
+            model.contains("    pub self_: Option<String>,"),
+            "`self` cannot be a raw identifier: {model}"
+        );
+        // A keyword that *can* be raw needs no rename: serde strips the `r#`.
+        assert!(
+            model.contains("    pub r#type: Option<String>,")
+                && !model.contains(r#"#[serde(rename = "type")]"#),
+            "`type` should be emitted as a raw identifier: {model}"
+        );
+
+        let defaults = file_content(&crate_, "src/default.rs");
+        assert!(
+            defaults.contains("pub(crate) fn default_series_10min() -> String"),
+            "default fn should follow the field identifier: {defaults}"
+        );
+        assert!(
+            model.contains(r#"#[serde(default = "crate::default::default_series_10min")]"#),
+            "serde attr should name the same function: {model}"
+        );
+
+        let validation = file_content(&crate_, "src/validation.rs");
+        assert!(
+            validation.contains("&self.first_name"),
+            "validation should access the field by its identifier: {validation}"
+        );
+        assert!(
+            validation.contains("\"first-name: length"),
+            "validation messages should keep the spec's name: {validation}"
+        );
+
+        Ok(())
+    }
+
+    /// A spec written in camelCase generates snake_case fields: rustc lints a
+    /// field that is not snake_case, so passing the name through would make the
+    /// *generated* crate warn. The wire name comes back via the rename.
+    #[test]
+    fn camel_case_properties_become_snake_case_fields() -> Result<()> {
+        let yaml = r#"
+openapi: "3.0.3"
+info:
+  title: Test
+  version: "0.1.0"
+paths:
+  /users:
+    get:
+      operationId: listUsers
+      parameters:
+        - name: pageSize
+          in: query
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: ok
+components:
+  schemas:
+    User:
+      type: object
+      properties:
+        firstName:
+          type: string
+        userID:
+          type: string
+        HTTPProxyURL:
+          type: string
+        already_snake:
+          type: string
+"#;
+        let crate_ = generate(&load_spec(yaml)?, &test_config())?;
+        let model = file_content(&crate_, "src/model.rs");
+
+        for (property, field) in [
+            ("firstName", "first_name"),
+            ("userID", "user_id"),
+            // An acronym is one word, not one word per letter.
+            ("HTTPProxyURL", "http_proxy_url"),
+            ("pageSize", "page_size"),
+        ] {
+            assert!(
+                model.contains(&format!(
+                    "    #[serde(rename = \"{property}\")]\n    pub {field}: "
+                )),
+                "{property} should become {field}, renamed back on the wire: {model}"
+            );
+        }
+        // A name that is already snake_case needs no rename.
+        assert!(
+            model.contains("    pub already_snake: Option<String>,")
+                && !model.contains(r#"#[serde(rename = "already_snake")]"#),
+            "an unchanged name should not be renamed: {model}"
+        );
+
+        Ok(())
+    }
+
+    /// Two properties of one struct that sanitize to the same field identifier
+    /// abort for the same reason as two enum values do.
+    #[test]
+    fn colliding_property_names_abort() -> Result<()> {
+        let yaml = r#"
+openapi: "3.0.3"
+info:
+  title: Test
+  version: "0.1.0"
+paths: {}
+components:
+  schemas:
+    Series:
+      type: object
+      properties:
+        "first-name":
+          type: string
+        "first.name":
+          type: string
+"#;
+        let message = spec_error(yaml);
+        assert!(
+            message.contains(
+                r#"properties "first-name" and "first.name" would both become the Rust struct field `first_name`"#
+            ),
+            "the error should name both properties: {message}"
+        );
+
+        Ok(())
+    }
+
+    /// Schema names become type names, at the definition and at every `$ref`
+    /// that reaches them.
+    #[test]
+    fn schema_names_that_are_not_identifiers() -> Result<()> {
+        let yaml = r#"
+openapi: "3.0.3"
+info:
+  title: Test
+  version: "0.1.0"
+paths: {}
+components:
+  schemas:
+    3d-model:
+      type: object
+      properties:
+        size:
+          type: number
+    Holder:
+      type: object
+      properties:
+        model:
+          $ref: '#/components/schemas/3d-model'
+"#;
+        let crate_ = generate(&load_spec(yaml)?, &test_config())?;
+        let model = file_content(&crate_, "src/model.rs");
+
+        assert!(
+            model.contains("pub struct Type3dModel {"),
+            "schema name should become a type identifier: {model}"
+        );
+        assert!(
+            model.contains("    pub model: Option<Type3dModel>,"),
+            "a $ref should resolve to the same type name: {model}"
+        );
+
+        Ok(())
+    }
+
+    /// Two schema names that map to one type name are worse still: the `$ref`s
+    /// to them are indistinguishable, so there is not even a wrong answer to
+    /// pick.
+    #[test]
+    fn schemas_that_map_to_the_same_type_name_abort() -> Result<()> {
+        let yaml = r#"
+openapi: "3.0.3"
+info:
+  title: Test
+  version: "0.1.0"
+paths: {}
+components:
+  schemas:
+    foo-bar:
+      type: object
+      properties:
+        a:
+          type: string
+    foo_bar:
+      type: object
+      properties:
+        b:
+          type: string
+"#;
+        let message = spec_error(yaml);
+        assert!(
+            message.contains(
+                r#"schemas "foo-bar" and "foo_bar" would both become the Rust type `FooBar`"#
+            ),
+            "the error should name both schemas: {message}"
+        );
+
+        Ok(())
+    }
+
+    /// A pathological spec: every name is hostile. Nothing here is expected to
+    /// be pretty: what matters is that generation completes (the writer
+    /// asserts every identifier it emits) and that the wire strings put back by
+    /// `#[serde(rename)]` are correctly escaped.
+    #[test]
+    fn hostile_names_still_generate() -> Result<()> {
+        let yaml = r#"
+openapi: "3.0.3"
+info:
+  title: Test
+  version: "0.1.0"
+paths: {}
+components:
+  schemas:
+    Odd:
+      type: object
+      properties:
+        "say \"hi\"":
+          type: string
+        "back\\slash":
+          type: string
+        "é":
+          type: string
+        kind:
+          type: string
+          enum: ['say "hi"', "0"]
+"#;
+        let crate_ = generate(&load_spec(yaml)?, &test_config())?;
+        let model = file_content(&crate_, "src/model.rs");
+
+        assert!(
+            model.contains(r#"#[serde(rename = "say \"hi\"")]"#),
+            "quotes in a wire name must be escaped: {model}"
+        );
+        assert!(
+            model.contains(r#"#[serde(rename = "back\\slash")]"#),
+            "backslashes in a wire name must be escaped: {model}"
+        );
+        assert!(
+            model.contains("    pub say_hi: Option<String>,")
+                && model.contains("    pub back_slash: Option<String>,"),
+            "punctuated property names should be sanitized: {model}"
+        );
+        assert!(
+            model.contains("    pub é: Option<String>,"),
+            "a non-ASCII name is already a valid identifier: {model}"
+        );
+        assert!(
+            model.contains("    Variant0,"),
+            "a digit-only value takes the variant prefix: {model}"
+        );
+
+        Ok(())
+    }
+
+    /// A name with nothing to build an identifier from (`""`, `"!!!"`, `"_"`)
+    /// leaves the generator no name to derive. `Empty` or `unnamed` would say
+    /// nothing about what the item holds, so this aborts like a collision does.
+    #[test]
+    fn names_with_nothing_to_build_on_abort() -> Result<()> {
+        let cases = [
+            (
+                "an enum value",
+                r#"
+        kind:
+          type: string
+          enum: ["ok", ""]
+"#,
+                r#"enum value "" has nothing a Rust name can be built from"#,
+            ),
+            (
+                "a property name",
+                r#"
+        "!!!":
+          type: string
+"#,
+                r#"property name "!!!" has nothing a Rust name can be built from"#,
+            ),
+            (
+                "a property named `_`",
+                r#"
+        "_":
+          type: string
+"#,
+                r#"property name "_" has nothing a Rust name can be built from"#,
+            ),
+        ];
+
+        for (what, properties, expected) in cases {
+            let yaml = format!(
+                r#"
+openapi: "3.0.3"
+info:
+  title: Test
+  version: "0.1.0"
+paths: {{}}
+components:
+  schemas:
+    Series:
+      type: object
+      properties:{properties}"#
+            );
+            let message = spec_error(&yaml);
+            assert!(
+                message.contains(expected),
+                "{what} should be reported: {message}"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// A `$ref` to a schema that is not in the spec leaves the field naming a
+    /// type nothing defines. The generator cannot invent it, so it aborts
+    /// rather than emit a crate that will not compile.
+    #[test]
+    fn a_ref_to_a_missing_schema_aborts() -> Result<()> {
+        let yaml = r#"
+openapi: "3.0.3"
+info:
+  title: Test
+  version: "0.1.0"
+paths: {}
+components:
+  schemas:
+    Holder:
+      type: object
+      properties:
+        gone:
+          $ref: '#/components/schemas/Nope'
+"#;
+        let message = spec_error(yaml);
+        assert!(
+            message.contains(
+                r##"$ref "#/components/schemas/Nope" names a schema that does not exist"##
+            ),
+            "the reference should be named in full: {message}"
+        );
+
+        Ok(())
+    }
+
+    /// Same for a `$ref` to a schema that exists but generated nothing, whether
+    /// the field holds it directly or in an array.
+    #[test]
+    fn a_ref_to_an_ungenerated_schema_aborts() -> Result<()> {
+        let yaml = r#"
+openapi: "3.0.3"
+info:
+  title: Test
+  version: "0.1.0"
+paths: {}
+components:
+  schemas:
+    Base:
+      type: object
+      properties:
+        id:
+          type: string
+    Derived:
+      allOf:
+        - $ref: '#/components/schemas/Base'
+    Holder:
+      type: object
+      properties:
+        derived:
+          $ref: '#/components/schemas/Derived'
+        many:
+          type: array
+          items:
+            $ref: '#/components/schemas/Derived'
+"#;
+        let message = spec_error(yaml);
+        for field in ["Holder.derived", "Holder.many"] {
+            assert!(
+                message.contains(field),
+                "{field} should be reported: {message}"
+            );
+        }
+        assert_eq!(
+            message
+                .matches(
+                    r##"$ref "#/components/schemas/Derived" names schema `Derived`, which produced no type"##
+                )
+                .count(),
+            2,
+            "an array element names its own $ref too: {message}"
+        );
+
+        Ok(())
+    }
+
+    /// A schema name is the same case, one level up.
+    #[test]
+    fn a_schema_name_with_nothing_to_build_on_aborts() -> Result<()> {
+        let yaml = r#"
+openapi: "3.0.3"
+info:
+  title: Test
+  version: "0.1.0"
+paths: {}
+components:
+  schemas:
+    "!!!":
+      type: object
+      properties:
+        a:
+          type: string
+"#;
+        let message = spec_error(yaml);
+        assert!(
+            message.contains(r#"schema name "!!!" has nothing a Rust name can be built from"#),
+            "the schema should be reported: {message}"
         );
 
         Ok(())

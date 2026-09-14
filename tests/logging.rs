@@ -1,9 +1,13 @@
-//! Fix 6 contract: `record` itself does not log, `generate()` does not log
-//! (it returns the diagnostics), and the `parse()` convenience wrapper — which
-//! discards them — surfaces them via `log` at `warn`.
+//! Who logs a diagnostic, and who does not.
 //!
-//! A single test drives both paths so the process-global logger and the shared
-//! capture buffer are never touched concurrently.
+//! Recording a diagnostic never logs. `generate` returns the list instead, so
+//! that a caller (the CLI) can render its own summary without each diagnostic
+//! being printed twice. The `parse` convenience wrapper is the exception: it
+//! discards the list, so it surfaces every diagnostic through `log` at `warn`
+//! rather than letting them vanish.
+//!
+//! One test drives both paths, since the logger and the capture buffer are
+//! process-global and tests share a process.
 
 use std::sync::Mutex;
 
