@@ -12,7 +12,7 @@ mod parse;
 mod write;
 
 pub use diagnostic::{Diagnostic, Severity};
-pub use parse::{parse, parse_with_diagnostics};
+pub use parse::parse;
 pub use write::write;
 
 use openapiv3::OpenAPI;
@@ -41,9 +41,9 @@ pub struct GeneratedCrate {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntityKind {
-    /// From `components.schemas` — derives Serialize + Deserialize.
+    /// From `components.schemas`, derives Serialize + Deserialize.
     Schema,
-    /// From operation query parameters — derives only Deserialize.
+    /// From operation query parameters, derives only Deserialize.
     Query,
 }
 
@@ -106,7 +106,7 @@ pub struct EnumDef {
 /// to an untagged enum (`#[serde(untagged)]`).
 ///
 /// Every variant of a tagged union is guaranteed to wrap a generated *struct*,
-/// and that struct is guaranteed not to declare `prop` as a field — serde emits
+/// and that struct is guaranteed not to declare `prop` as a field, since serde emits
 /// the tag key itself. Both invariants are established by the `resolve_unions`
 /// post-pass in [`parse`], not by the per-schema parse.
 #[derive(Debug, PartialEq)]
@@ -135,7 +135,7 @@ pub struct UnionVariant {
 /// Constraints extracted from a single field's OpenAPI schema.
 #[derive(Debug, PartialEq)]
 pub enum Constraints {
-    /// No constraints — field needs no validation checks.
+    /// No constraints: the field needs no validation checks.
     None,
     String {
         min_length: Option<usize>,
@@ -163,9 +163,9 @@ pub enum Constraints {
         max_items: Option<usize>,
         unique_items: bool,
     },
-    /// Field is a `$ref` to another generated struct — call `.validate()`.
+    /// Field is a `$ref` to another generated struct: call `.validate()`.
     Nested,
-    /// Field is `Vec<$ref>` — iterate and call `.validate()` on each element.
+    /// Field is `Vec<$ref>`: iterate and call `.validate()` on each element.
     VecNested,
 }
 
@@ -287,8 +287,7 @@ pub fn load_spec(yaml: &str) -> Result<OpenAPI> {
 /// could not be fully generated (dropped or degraded). It is empty when the
 /// whole spec was representable.
 pub fn generate(spec: &OpenAPI, config: &Config) -> Result<GeneratedCrate> {
-    let mut diagnostics = Vec::new();
-    let entities = parse_with_diagnostics(spec, &mut diagnostics);
+    let (entities, mut diagnostics) = parse(spec);
     let mut generated = write(&entities, config)?;
     // Parse-time diagnostics come first (spec order), then write-time ones.
     diagnostics.append(&mut generated.diagnostics);
@@ -378,7 +377,7 @@ components:
         assert_eq!(
             file_content(&crate_, "src/model.rs"),
             "\
-// This file is @generated — do not edit manually.
+// This file is @generated. Do not edit manually.
 
 use serde::{Deserialize, Serialize};
 
@@ -444,7 +443,7 @@ components:
         assert_eq!(
             file_content(&crate_, "src/model.rs"),
             "\
-// This file is @generated — do not edit manually.
+// This file is @generated. Do not edit manually.
 
 use serde::{Deserialize, Serialize};
 
@@ -458,7 +457,7 @@ pub struct GetThingsQuery {
         assert_eq!(
             file_content(&crate_, "src/validation.rs"),
             "\
-// This file is @generated — do not edit manually.
+// This file is @generated. Do not edit manually.
 
 use crate::model::*;
 
@@ -533,7 +532,7 @@ paths: {}
         assert_eq!(
             file_content(&crate_, "Cargo.toml"),
             "\
-# This file is @generated — do not edit manually.
+# This file is @generated. Do not edit manually.
 
 [package]
 name = \"test_api\"
@@ -553,7 +552,7 @@ pretty_assertions.workspace = true
         assert_eq!(
             file_content(&crate_, "src/lib.rs"),
             "\
-// This file is @generated — do not edit manually.
+// This file is @generated. Do not edit manually.
 
 mod model;
 mod validation;
@@ -993,7 +992,7 @@ components:
     }
 
     /// Both members declare the discriminator property `petType`, the way real
-    /// specs do — `Pet` must absorb it into the serde tag rather than leaving it
+    /// specs do, `Pet` must absorb it into the serde tag rather than leaving it
     /// on the structs.
     const ONE_OF_SPEC: &str = r##"
 openapi: "3.0.3"
@@ -1064,7 +1063,7 @@ components:
         );
 
         // serde writes the `petType` key itself for the tagged union, so the
-        // member structs must not also declare it — otherwise serializing emits
+        // member structs must not also declare it, or serializing emits
         // a duplicate key and deserializing fails with `missing field petType`.
         assert!(
             !model.contains("pub petType"),
@@ -1174,7 +1173,7 @@ components:
 
     /// A default the spec declares but the writer cannot render (here `1.5` for
     /// an `i32`) produces no default function, so no `default.rs` module should
-    /// be emitted for it — an empty module would otherwise be left behind.
+    /// be emitted for it, or an empty module would be left behind.
     #[test]
     fn unrenderable_default_omits_default_module() -> Result<()> {
         let yaml = r#"
@@ -1214,7 +1213,7 @@ components:
     }
 
     /// Absorbing a discriminator into the serde tag is a representation choice,
-    /// not a loss, so it is never reported — including when the member is also
+    /// not a loss, so it is never reported, including when the member is also
     /// reached directly, where the key is redundant with the field's static type.
     #[test]
     fn absorbing_discriminator_is_silent() -> Result<()> {
@@ -1313,22 +1312,26 @@ components:
         let crate_ = generate(&load_spec(yaml)?, &test_config())?;
         let model = file_content(&crate_, "src/model.rs");
 
-        for (value, variant) in [
-            ("10min", "Variant10min"),
-            ("1h", "Variant1h"),
-            ("P1D", "P1D"),
-            ("with space", "WithSpace"),
-            ("x/y", "XY"),
-            // `Self` cannot be written as a raw identifier.
-            ("self", "Self_"),
-        ] {
-            assert!(
-                model.contains(&format!(
-                    "    #[serde(rename = \"{value}\")]\n    {variant},\n"
-                )),
-                "value {value:?} should become variant {variant}: {model}"
-            );
-        }
+        // `P1D` is already usable, and `self` cannot be a raw identifier.
+        assert!(
+            model.contains(
+                r#"pub enum SeriesResolution {
+    #[serde(rename = "10min")]
+    Variant10min,
+    #[serde(rename = "1h")]
+    Variant1h,
+    #[serde(rename = "P1D")]
+    P1D,
+    #[serde(rename = "with space")]
+    WithSpace,
+    #[serde(rename = "x/y")]
+    XY,
+    #[serde(rename = "self")]
+    Self_,
+}"#
+            ),
+            "generated model:\n{model}"
+        );
 
         // Sanitizing loses nothing: the wire value survives in the rename.
         assert!(
@@ -1360,20 +1363,14 @@ components:
           type: string
           enum: ["a.b", "a-b"]
 "#;
-        let message = spec_error(yaml);
-        assert!(
-            message.contains(
-                r#"enum values "a.b" and "a-b" would both become the Rust enum variant `AB`"#
-            ),
-            "the error should name both values: {message}"
-        );
-        assert!(
-            message.contains("Series.kind"),
-            "the error should point at the spec location: {message}"
-        );
-        assert!(
-            message.contains("Fix the spec"),
-            "the error should say what to do: {message}"
+        assert_eq!(
+            spec_error(yaml),
+            r#"1 fatal problem in the spec
+
+  Series.kind
+    enum values "a.b" and "a-b" would both become the Rust enum variant `AB`
+
+Fix the spec, then re-run. No files were written."#
         );
 
         Ok(())
@@ -1399,12 +1396,14 @@ components:
           type: string
           enum: ["10min", "Variant10min"]
 "#;
-        let message = spec_error(yaml);
-        assert!(
-            message.contains(
-                r#"enum values "10min" and "Variant10min" would both become the Rust enum variant `Variant10min`"#
-            ),
-            "the error should name both values: {message}"
+        assert_eq!(
+            spec_error(yaml),
+            r#"1 fatal problem in the spec
+
+  Series.resolution
+    enum values "10min" and "Variant10min" would both become the Rust enum variant `Variant10min`
+
+Fix the spec, then re-run. No files were written."#
         );
 
         Ok(())
@@ -1513,47 +1512,64 @@ components:
         let crate_ = generate(&load_spec(yaml)?, &test_config())?;
         let model = file_content(&crate_, "src/model.rs");
 
+        // `type` needs no rename: serde strips the `r#`.
         assert!(
-            model.contains("    #[serde(rename = \"first-name\")]\n"),
-            "a renamed field needs the wire name back: {model}"
-        );
-        assert!(
-            model.contains("    pub first_name: Option<String>,"),
-            "`first-name` should become `first_name`: {model}"
-        );
-        assert!(
-            model.contains("    pub _10min: String,"),
-            "a leading digit should be prefixed: {model}"
-        );
-        assert!(
-            model.contains("    pub self_: Option<String>,"),
-            "`self` cannot be a raw identifier: {model}"
-        );
-        // A keyword that *can* be raw needs no rename: serde strips the `r#`.
-        assert!(
-            model.contains("    pub r#type: Option<String>,")
-                && !model.contains(r#"#[serde(rename = "type")]"#),
-            "`type` should be emitted as a raw identifier: {model}"
+            model.contains(
+                r##"pub struct Series {
+    #[serde(rename = "10min")]
+    #[serde(default = "crate::default::default_series_10min")]
+    pub _10min: String,
+    #[serde(rename = "first-name")]
+    pub first_name: Option<String>,
+    #[serde(rename = "self")]
+    pub self_: Option<String>,
+    pub r#type: Option<String>,
+}"##
+            ),
+            "generated model:\n{model}"
         );
 
+        // The default function follows the field identifier, not the property.
         let defaults = file_content(&crate_, "src/default.rs");
         assert!(
-            defaults.contains("pub(crate) fn default_series_10min() -> String"),
-            "default fn should follow the field identifier: {defaults}"
-        );
-        assert!(
-            model.contains(r#"#[serde(default = "crate::default::default_series_10min")]"#),
-            "serde attr should name the same function: {model}"
+            defaults.contains(
+                r#"pub(crate) fn default_series_10min() -> String {
+    String::from("x")
+}"#
+            ),
+            "generated defaults:\n{defaults}"
         );
 
+        // Checks reach the field by its identifier; messages keep the spec's name.
         let validation = file_content(&crate_, "src/validation.rs");
         assert!(
-            validation.contains("&self.first_name"),
-            "validation should access the field by its identifier: {validation}"
+            validation.contains(
+                r#"impl Validation for Series {
+    fn validate(&self) -> Result<(), ValidationError> {
+        let mut errors = Vec::new();
+        if let Some(val) = &self.first_name
+            && (*val).chars().count() > 5
+        {
+            errors.push(format!(
+                "first-name: length {} exceeds maximum 5",
+                (*val).chars().count()
+            ));
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(ValidationError { details: errors })
+        }
+    }
+}"#
+            ),
+            "generated validation:\n{validation}"
         );
+        // Sanitizing a property name is not a loss: the rename carries it.
         assert!(
-            validation.contains("\"first-name: length"),
-            "validation messages should keep the spec's name: {validation}"
+            crate_.diagnostics.is_empty(),
+            "expected no diagnostics, got {:?}",
+            crate_.diagnostics
         );
 
         Ok(())
@@ -1598,25 +1614,38 @@ components:
         let crate_ = generate(&load_spec(yaml)?, &test_config())?;
         let model = file_content(&crate_, "src/model.rs");
 
-        for (property, field) in [
-            ("firstName", "first_name"),
-            ("userID", "user_id"),
-            // An acronym is one word, not one word per letter.
-            ("HTTPProxyURL", "http_proxy_url"),
-            ("pageSize", "page_size"),
-        ] {
-            assert!(
-                model.contains(&format!(
-                    "    #[serde(rename = \"{property}\")]\n    pub {field}: "
-                )),
-                "{property} should become {field}, renamed back on the wire: {model}"
-            );
-        }
-        // A name that is already snake_case needs no rename.
+        // An acronym is one word, not one word per letter, and a name that is
+        // already snake_case needs no rename.
         assert!(
-            model.contains("    pub already_snake: Option<String>,")
-                && !model.contains(r#"#[serde(rename = "already_snake")]"#),
-            "an unchanged name should not be renamed: {model}"
+            model.contains(
+                r#"pub struct User {
+    #[serde(rename = "firstName")]
+    pub first_name: Option<String>,
+    #[serde(rename = "userID")]
+    pub user_id: Option<String>,
+    #[serde(rename = "HTTPProxyURL")]
+    pub http_proxy_url: Option<String>,
+    pub already_snake: Option<String>,
+}"#
+            ),
+            "generated model:\n{model}"
+        );
+        // Query parameters are the same, and the rename is what keeps the URL
+        // parameter readable.
+        assert!(
+            model.contains(
+                r#"pub struct ListUsersQuery {
+    #[serde(rename = "pageSize")]
+    pub page_size: Option<i64>,
+}"#
+            ),
+            "generated model:\n{model}"
+        );
+        // Casing is not a loss: the wire name survives in the rename.
+        assert!(
+            crate_.diagnostics.is_empty(),
+            "expected no diagnostics, got {:?}",
+            crate_.diagnostics
         );
 
         Ok(())
@@ -1679,13 +1708,22 @@ components:
         let crate_ = generate(&load_spec(yaml)?, &test_config())?;
         let model = file_content(&crate_, "src/model.rs");
 
+        // The `$ref` resolves to the same name the definition was given.
         assert!(
-            model.contains("pub struct Type3dModel {"),
-            "schema name should become a type identifier: {model}"
+            model.contains(
+                r#"pub struct Type3dModel {
+    pub size: Option<f64>,
+}"#
+            ),
+            "generated model:\n{model}"
         );
         assert!(
-            model.contains("    pub model: Option<Type3dModel>,"),
-            "a $ref should resolve to the same type name: {model}"
+            model.contains(
+                r#"pub struct Holder {
+    pub model: Option<Type3dModel>,
+}"#
+            ),
+            "generated model:\n{model}"
         );
 
         Ok(())
@@ -1756,26 +1794,31 @@ components:
         let crate_ = generate(&load_spec(yaml)?, &test_config())?;
         let model = file_content(&crate_, "src/model.rs");
 
+        // Quotes and backslashes survive into the rename, escaped; a non-ASCII
+        // name is already a valid identifier.
         assert!(
-            model.contains(r#"#[serde(rename = "say \"hi\"")]"#),
-            "quotes in a wire name must be escaped: {model}"
+            model.contains(
+                r#"pub struct Odd {
+    #[serde(rename = "say \"hi\"")]
+    pub say_hi: Option<String>,
+    #[serde(rename = "back\\slash")]
+    pub back_slash: Option<String>,
+    pub é: Option<String>,
+    pub kind: Option<OddKind>,
+}"#
+            ),
+            "generated model:\n{model}"
         );
         assert!(
-            model.contains(r#"#[serde(rename = "back\\slash")]"#),
-            "backslashes in a wire name must be escaped: {model}"
-        );
-        assert!(
-            model.contains("    pub say_hi: Option<String>,")
-                && model.contains("    pub back_slash: Option<String>,"),
-            "punctuated property names should be sanitized: {model}"
-        );
-        assert!(
-            model.contains("    pub é: Option<String>,"),
-            "a non-ASCII name is already a valid identifier: {model}"
-        );
-        assert!(
-            model.contains("    Variant0,"),
-            "a digit-only value takes the variant prefix: {model}"
+            model.contains(
+                r#"pub enum OddKind {
+    #[serde(rename = "say \"hi\"")]
+    SayHi,
+    #[serde(rename = "0")]
+    Variant0,
+}"#
+            ),
+            "generated model:\n{model}"
         );
 
         Ok(())

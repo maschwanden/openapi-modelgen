@@ -31,7 +31,7 @@ struct Args {
     #[arg(long, default_value_t = false)]
     workspace: bool,
 
-    /// Fail (non-zero exit) if any part of the spec was not fully generated —
+    /// Fail (non-zero exit) if any part of the spec was not fully generated,
     /// dropped *or* degraded. A degraded construct still loses information, and
     /// some (an external `$ref`, say) leave code that will not compile. Files
     /// are always written; the exit code lets CI gate on lossless generation.

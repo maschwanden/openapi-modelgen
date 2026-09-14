@@ -1,5 +1,5 @@
 {
-  description = "openapi-modelgen — generate Rust request and response types from OpenAPI 3.0 specs";
+  description = "openapi-modelgen: generate Rust request and response types from OpenAPI 3.0 specs";
 
   inputs = {
     nixpkgs.url = "nixpkgs/nixos-25.11";

@@ -57,7 +57,7 @@ impl fmt::Display for Diagnostic {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "{} — {} ({}, {})",
+            "{}: {} ({}, {})",
             self.path,
             self.reason,
             self.construct,
@@ -69,9 +69,9 @@ impl fmt::Display for Diagnostic {
 /// Record a diagnostic by pushing it onto the collector.
 ///
 /// The collector is the single source of truth: it is returned from
-/// [`crate::generate`] and logged at `warn` by the [`crate::parse`] convenience
-/// wrapper. Recording does not log here — that would double-print on the CLI,
-/// which renders its own summary from the returned list.
+/// [`crate::generate`] and from [`crate::parse`]. Recording never logs, which
+/// would double-print on the CLI, since that renders its own summary from the
+/// returned list.
 pub(crate) fn record(
     diagnostics: &mut Vec<Diagnostic>,
     severity: Severity,

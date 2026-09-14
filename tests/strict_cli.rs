@@ -1,5 +1,5 @@
 //! End-to-end `--strict` behavior: it fails on anything that was not fully
-//! generated — dropped *or* degraded. A run with no diagnostics at all exits 0.
+//! generated, dropped *or* degraded. A run with no diagnostics at all exits 0.
 
 use std::{fs, process::Command};
 
@@ -75,7 +75,7 @@ components:
     assert_eq!(status.code(), Some(2), "degraded should fail --strict");
 }
 
-/// A fully-representable spec exits 0 under `--strict` — the flag must not be
+/// A fully-representable spec exits 0 under `--strict`: the flag must not be
 /// unconditionally red.
 #[test]
 fn strict_passes_on_clean_spec() {

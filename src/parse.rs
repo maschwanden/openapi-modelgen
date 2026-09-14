@@ -11,24 +11,20 @@ use crate::{
     ident::{to_pascal_case, to_type_ident, to_variant_ident},
 };
 
-/// Parse an OpenAPI spec into a list of entities, discarding diagnostics.
+/// Parse an OpenAPI spec into a list of entities, plus a [`Diagnostic`] for
+/// every construct that is dropped or degraded.
 ///
-/// Prefer [`parse_with_diagnostics`] (or [`crate::generate`]) when you need to
-/// know which spec constructs could not be generated.
-pub fn parse(spec: &OpenAPI) -> Vec<Entity> {
+/// A caller with no use for the diagnostics discards them at the call site
+/// (`let (entities, _) = parse(spec)`), which is visible where it happens.
+pub fn parse(spec: &OpenAPI) -> (Vec<Entity>, Vec<Diagnostic>) {
     let mut diagnostics = Vec::new();
-    let entities = parse_with_diagnostics(spec, &mut diagnostics);
-    // This convenience wrapper drops the diagnostics, so surface them via the
-    // log (at `warn`) for callers that don't want the returned list.
-    for diagnostic in &diagnostics {
-        log::warn!("{diagnostic}");
-    }
-    entities
+    let entities = parse_entities(spec, &mut diagnostics);
+    (entities, diagnostics)
 }
 
-/// Parse an OpenAPI spec into a list of entities, recording a [`Diagnostic`]
-/// for every construct that is dropped or degraded.
-pub fn parse_with_diagnostics(spec: &OpenAPI, diagnostics: &mut Vec<Diagnostic>) -> Vec<Entity> {
+/// The parse itself. Diagnostics are threaded as `&mut` here, as they are
+/// through every function below; only the public boundary hands back a list.
+fn parse_entities(spec: &OpenAPI, diagnostics: &mut Vec<Diagnostic>) -> Vec<Entity> {
     let mut entities = Vec::new();
 
     if let Some(components) = &spec.components {
@@ -156,7 +152,7 @@ pub fn parse_with_diagnostics(spec: &OpenAPI, diagnostics: &mut Vec<Diagnostic>)
 ///
 /// * drops variants whose member produced no type (e.g. an `allOf` schema),
 ///   which would otherwise reference a nonexistent Rust type;
-/// * drops non-struct variants of a *tagged* union — serde's internally tagged
+/// * drops non-struct variants of a *tagged* union, since serde's internally tagged
 ///   representation requires each payload to serialize as a map, and a variant
 ///   wrapping an enum or scalar silently round-trips to garbage;
 /// * drops variants whose PascalCase name collides with an earlier one, which
@@ -453,7 +449,7 @@ fn content_has_inline_schema<'a>(
 ///
 /// A body is a loss only when its content schema is *inline*; a `$ref` content
 /// schema points at a component we do generate. `$ref` bodies/responses are
-/// resolved against `components`, then the same inline check applies — an
+/// resolved against `components`, then the same inline check applies: an
 /// unresolvable `$ref` (external or missing) is itself a genuine loss.
 fn diagnose_operation_bodies(
     op: &Operation,
@@ -625,7 +621,7 @@ fn parse_schema(name: &str, schema: &Schema, diagnostics: &mut Vec<Diagnostic>) 
             !required || nullable
         };
 
-        // If the field was converted to an enum type, serde handles validation —
+        // If the field was converted to an enum type, serde handles validation,
         // no runtime constraints needed.
         let constraints = if is_inline_enum {
             Constraints::None
@@ -749,7 +745,7 @@ fn parse_enum(
 ///
 /// Each member is expected to be a `$ref` to a local component schema; each
 /// becomes an enum variant wrapping the referenced type. Inline (non-`$ref`)
-/// and non-local members are out of scope — they are skipped. If a
+/// and non-local members are out of scope, so they are skipped. If a
 /// `discriminator` is present the union is internally tagged, and every variant
 /// gets a wire value: the `mapping` key when one points at the member,
 /// otherwise the member's schema name, which is what OpenAPI implies.
@@ -761,7 +757,7 @@ fn parse_enum(
 /// Per-member skip diagnostics are buffered and only flushed when a union is
 /// actually produced (a mix of usable variants and skipped members). If *no*
 /// variant survives, nothing is recorded here so the single schema-level drop in
-/// `diagnose_unsupported_schema` fires instead — avoiding a double report for
+/// `diagnose_unsupported_schema` fires instead, avoiding a double report for
 /// the same schema.
 fn parse_one_of(name: &str, schema: &Schema, diagnostics: &mut Vec<Diagnostic>) -> Option<Entity> {
     let SchemaKind::OneOf { one_of } = &schema.schema_kind else {
@@ -784,7 +780,7 @@ fn parse_one_of(name: &str, schema: &Schema, diagnostics: &mut Vec<Diagnostic>) 
             );
             continue;
         };
-        // A non-local $ref has no generated type and no valid Rust name — using
+        // A non-local $ref has no generated type and no valid Rust name; using
         // it would emit the raw ref string as an identifier.
         if !is_local_schema_ref(reference) {
             record(
@@ -799,14 +795,23 @@ fn parse_one_of(name: &str, schema: &Schema, diagnostics: &mut Vec<Diagnostic>) 
             continue;
         }
         let ref_name = resolve_ref_name(reference);
-        // The schema name is the wire value; the Rust type derives from it. A
-        // name that yields no type is reported where the schema itself is.
+        // The schema name is the wire value; the Rust type derives from it.
         let Some(type_name) = to_type_ident(&ref_name) else {
+            record(
+                &mut skipped,
+                Severity::Dropped,
+                path.clone(),
+                "oneOf member",
+                format!(
+                    "member `{ref_name}` has nothing a Rust name can be built from; \
+                     the variant was dropped"
+                ),
+            );
             continue;
         };
 
         // A discriminator mapping key overrides the wire value; without one,
-        // OpenAPI uses the member's schema name — which is not necessarily the
+        // OpenAPI uses the member's schema name, which is not necessarily the
         // PascalCase variant name, so it still has to be recorded.
         let wire_value = discriminator.map(|d| {
             d.mapping
@@ -869,7 +874,7 @@ fn parse_query(
         };
         match param {
             openapiv3::Parameter::Query { .. } => query_params.push(param),
-            // Path parameters live in the URL, not the query struct — excluded by design.
+            // Path parameters live in the URL, not the query struct: excluded by design.
             openapiv3::Parameter::Path { .. } => {}
             openapiv3::Parameter::Header { parameter_data, .. } => record(
                 diagnostics,
@@ -1096,7 +1101,7 @@ fn is_local_schema_ref(reference: &str) -> bool {
 }
 
 /// Record a diagnostic for a `$ref` that does not point at a local component
-/// schema — the generated type name is the raw ref string and will not compile.
+/// schema: the generated type name is the raw ref string and will not compile.
 fn diagnose_ref(reference: &str, context: &str, diagnostics: &mut Vec<Diagnostic>) {
     if !is_local_schema_ref(reference) {
         record(
@@ -1367,7 +1372,7 @@ components:
           type: string
 "
         );
-        let entities = parse(&load_spec(&yaml)?);
+        let (entities, _) = parse(&load_spec(&yaml)?);
         assert_eq!(entities.len(), 1);
         assert_eq!(
             entities[0],
@@ -1413,7 +1418,7 @@ components:
       enum: [ACTIVE, INACTIVE, PENDING]
 "
         );
-        let entities = parse(&load_spec(&yaml)?);
+        let (entities, _) = parse(&load_spec(&yaml)?);
         assert_eq!(entities.len(), 1);
         assert_eq!(
             entities[0],
@@ -1458,7 +1463,7 @@ components:
   schemas: {{}}
 "#
         );
-        let entities = parse(&load_spec(&yaml)?);
+        let (entities, _) = parse(&load_spec(&yaml)?);
         assert_eq!(entities.len(), 1);
         let Entity::Struct(s) = &entities[0] else {
             panic!("expected Entity::Struct");
@@ -1492,7 +1497,7 @@ components:
   schemas: {{}}
 "#
         );
-        let entities = parse(&load_spec(&yaml)?);
+        let (entities, _) = parse(&load_spec(&yaml)?);
         assert_eq!(entities.len(), 1);
         let Entity::Struct(s) = &entities[0] else {
             panic!("expected Entity::Struct");
@@ -1518,7 +1523,7 @@ properties:
     pattern: '^[A-Z]{3}$'",
         )?;
         assert_eq!(
-            first_struct_fields(&parse(&spec))[0].constraints,
+            first_struct_fields(&parse(&spec).0)[0].constraints,
             Constraints::String {
                 min_length: None,
                 max_length: None,
@@ -1540,7 +1545,7 @@ properties:
     enum: [5, 10, 15]",
         )?;
         assert_eq!(
-            first_struct_fields(&parse(&spec))[0].constraints,
+            first_struct_fields(&parse(&spec).0)[0].constraints,
             Constraints::Integer {
                 minimum: None,
                 maximum: None,
@@ -1565,7 +1570,7 @@ properties:
     exclusiveMaximum: true",
         )?;
         assert_eq!(
-            first_struct_fields(&parse(&spec))[0].constraints,
+            first_struct_fields(&parse(&spec).0)[0].constraints,
             Constraints::Number {
                 minimum: Some(0.0),
                 maximum: Some(100.0),
@@ -1588,7 +1593,7 @@ properties:
     uniqueItems: true",
         )?;
         assert_eq!(
-            first_struct_fields(&parse(&spec))[0].constraints,
+            first_struct_fields(&parse(&spec).0)[0].constraints,
             Constraints::Array {
                 min_items: None,
                 max_items: None,
@@ -1606,7 +1611,7 @@ properties:
     type: string",
         )?;
         assert_eq!(
-            first_struct_fields(&parse(&spec))[0].constraints,
+            first_struct_fields(&parse(&spec).0)[0].constraints,
             Constraints::None
         );
 
@@ -1619,7 +1624,7 @@ properties:
   active:
     type: boolean",
         )?;
-        assert_eq!(first_struct_fields(&parse(&spec))[0].rust_type, "bool");
+        assert_eq!(first_struct_fields(&parse(&spec).0)[0].rust_type, "bool");
 
         // Type mapping: number → f64
         let spec = spec_with_schema(
@@ -1630,7 +1635,7 @@ properties:
   score:
     type: number",
         )?;
-        assert_eq!(first_struct_fields(&parse(&spec))[0].rust_type, "f64");
+        assert_eq!(first_struct_fields(&parse(&spec).0)[0].rust_type, "f64");
 
         Ok(())
     }
@@ -1657,7 +1662,8 @@ properties:
 
     /// Same as [`spec_with_composite_spec`] but returns the parsed entities.
     fn spec_with_composite(composite_yaml: &str) -> Result<Vec<Entity>> {
-        Ok(parse(&spec_with_composite_spec(composite_yaml)?))
+        let (entities, _) = parse(&spec_with_composite_spec(composite_yaml)?);
+        Ok(entities)
     }
 
     fn find_union<'a>(entities: &'a [Entity], name: &str) -> &'a UnionDef {
@@ -1727,6 +1733,46 @@ Pet:
         Ok(())
     }
 
+    /// A member whose `$ref` target has no Rust name is dropped like any other
+    /// unusable member, and says so: a silently shorter union deserializes the
+    /// missing variant as an error at runtime.
+    #[test]
+    fn parse_one_of_drops_a_member_with_no_rust_name() -> Result<()> {
+        let spec = spec_with_composite_spec(
+            "\
+Cat:
+  type: object
+  properties:
+    name:
+      type: string
+Pet:
+  oneOf:
+    - $ref: '#/components/schemas/Cat'
+    - $ref: '#/components/schemas/!!!'",
+        )?;
+        let (entities, diagnostics) = parse(&spec);
+
+        let union = find_union(&entities, "Pet");
+        assert_eq!(
+            union
+                .variants
+                .iter()
+                .map(|v| v.variant_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Cat"]
+        );
+        assert!(
+            diagnostics.iter().any(|d| {
+                d.severity == Severity::Dropped
+                    && d.reason
+                        .contains("member `!!!` has nothing a Rust name can be built from")
+            }),
+            "the dropped member should be reported: {diagnostics:?}"
+        );
+
+        Ok(())
+    }
+
     /// A member whose schema name is not already PascalCase needs an explicit
     /// `#[serde(rename)]`: the implied tag value is the schema name, not the
     /// variant name derived from it. The wrapped type is the *generated* type
@@ -1747,7 +1793,7 @@ Pet:
   discriminator:
     propertyName: kind",
         )?;
-        let entities = parse(&spec);
+        let (entities, _) = parse(&spec);
         let union = find_union(&entities, "Pet");
         assert_eq!(
             union.variants,
@@ -1825,10 +1871,10 @@ Pet:
   discriminator:
     propertyName: name",
         )?;
-        let entities = parse(&spec);
+        let (entities, _) = parse(&spec);
 
         // `Cat`/`Dog` from the helper each have exactly one property, `name`,
-        // which is the discriminator here — so both end up field-less.
+        // which is the discriminator here, so both end up field-less.
         assert_eq!(
             field_names(find_struct(&entities, "Cat")),
             Vec::<&str>::new()
@@ -1852,7 +1898,7 @@ Pet:
     - $ref: '#/components/schemas/Cat'
     - $ref: '#/components/schemas/Dog'",
         )?;
-        let entities = parse(&spec);
+        let (entities, _) = parse(&spec);
         assert_eq!(field_names(find_struct(&entities, "Cat")), vec!["name"]);
 
         Ok(())
@@ -1869,8 +1915,7 @@ Pet:
     - $ref: 'other.yaml#/components/schemas/Fish'
     - $ref: '#/components/schemas/Dog'",
         )?;
-        let mut diagnostics = Vec::new();
-        let entities = parse_with_diagnostics(&spec, &mut diagnostics);
+        let (entities, diagnostics) = parse(&spec);
 
         let union = find_union(&entities, "Pet");
         assert_eq!(
@@ -1902,8 +1947,7 @@ Pet:
     - $ref: '#/components/schemas/Derived'
     - $ref: '#/components/schemas/Dog'",
         )?;
-        let mut diagnostics = Vec::new();
-        let entities = parse_with_diagnostics(&spec, &mut diagnostics);
+        let (entities, diagnostics) = parse(&spec);
 
         let union = find_union(&entities, "Pet");
         assert_eq!(
@@ -1938,8 +1982,7 @@ Pet:
   discriminator:
     propertyName: kind",
         )?;
-        let mut diagnostics = Vec::new();
-        let entities = parse_with_diagnostics(&spec, &mut diagnostics);
+        let (entities, diagnostics) = parse(&spec);
 
         let union = find_union(&entities, "Pet");
         assert_eq!(
@@ -1965,7 +2008,7 @@ Pet:
     - $ref: '#/components/schemas/Status'
     - $ref: '#/components/schemas/Dog'",
         )?;
-        assert_eq!(find_union(&parse(&untagged), "Pet").variants.len(), 2);
+        assert_eq!(find_union(&parse(&untagged).0, "Pet").variants.len(), 2);
 
         Ok(())
     }
@@ -1991,8 +2034,7 @@ Pet:
     - $ref: '#/components/schemas/pet_dog'
     - $ref: '#/components/schemas/PetDog'",
         )?;
-        let mut diagnostics = Vec::new();
-        let entities = parse_with_diagnostics(&spec, &mut diagnostics);
+        let (entities, diagnostics) = parse(&spec);
 
         assert_eq!(find_union(&entities, "Pet").variants.len(), 1);
         let d = find_diag(&diagnostics, "oneOf member");
@@ -2002,7 +2044,7 @@ Pet:
     }
 
     /// A union whose every member is unusable is removed rather than emitted as
-    /// an uninhabited enum — and it is reported exactly once.
+    /// an uninhabited enum, and it is reported exactly once.
     #[test]
     fn one_of_with_no_usable_member_is_removed() -> Result<()> {
         let spec = spec_with_composite_spec(
@@ -2014,8 +2056,7 @@ Pet:
   oneOf:
     - $ref: '#/components/schemas/Derived'",
         )?;
-        let mut diagnostics = Vec::new();
-        let entities = parse_with_diagnostics(&spec, &mut diagnostics);
+        let (entities, diagnostics) = parse(&spec);
 
         assert!(!entities.iter().any(|e| matches!(e, Entity::Union(_))));
         // One member report; no additional schema-level `oneOf` drop restating it.
@@ -2056,7 +2097,7 @@ components:
           $ref: '#/components/schemas/Kind'
 "
         ))?;
-        let entities = parse(&spec);
+        let (entities, _) = parse(&spec);
         let foo = find_struct(&entities, "Foo");
 
         let kind = &foo.fields[0];
@@ -2078,8 +2119,7 @@ components:
     /// Parse a full spec and return only the diagnostics.
     fn diagnostics_for(yaml: &str) -> Result<Vec<Diagnostic>> {
         let spec = load_spec(yaml)?;
-        let mut diagnostics = Vec::new();
-        let _ = parse_with_diagnostics(&spec, &mut diagnostics);
+        let (_, diagnostics) = parse(&spec);
         Ok(diagnostics)
     }
 
@@ -2251,7 +2291,7 @@ components:
     }
 
     /// A `$ref` request body and a `$ref` response schema point at components we
-    /// generate — no loss, no diagnostic. (Regression for the false-positive.)
+    /// generate: no loss, no diagnostic. (Regression for the false-positive.)
     #[test]
     fn diagnostic_ref_bodies_are_clean() -> Result<()> {
         let diags = diagnostics_for(&format!(
@@ -2489,8 +2529,8 @@ components:
         diags.iter().filter(|d| d.construct == construct).count()
     }
 
-    /// An all-inline `oneOf` (no `$ref` members) yields exactly ONE diagnostic —
-    /// the schema-level drop — not one per skipped member plus the drop.
+    /// An all-inline `oneOf` (no `$ref` members) yields exactly ONE diagnostic,
+    /// the schema-level drop, not one per skipped member plus the drop.
     #[test]
     fn diagnostic_all_inline_one_of_single() -> Result<()> {
         let spec = spec_with_composite_spec(
@@ -2506,8 +2546,7 @@ Pet:
         b:
           type: string",
         )?;
-        let mut diagnostics = Vec::new();
-        let entities = parse_with_diagnostics(&spec, &mut diagnostics);
+        let (entities, diagnostics) = parse(&spec);
 
         // No union produced, and exactly one schema-level drop for the oneOf.
         assert!(!entities.iter().any(|e| matches!(e, Entity::Union(_))));
@@ -2535,8 +2574,7 @@ Pet:
         b:
           type: string",
         )?;
-        let mut diagnostics = Vec::new();
-        let entities = parse_with_diagnostics(&spec, &mut diagnostics);
+        let (entities, diagnostics) = parse(&spec);
         assert!(
             entities
                 .iter()

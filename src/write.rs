@@ -75,7 +75,7 @@ pub fn write(entities: &[Entity], config: &Config) -> Result<GeneratedCrate, std
 }
 
 fn header_comment() -> &'static str {
-    "This file is @generated — do not edit manually."
+    "This file is @generated. Do not edit manually."
 }
 
 /// Collect deduplicated inline enum names from struct entities.
@@ -152,11 +152,12 @@ fn field_ident(struct_name: &str, field: &Field, field_idents: &FieldIdents) -> 
 /// Leading underscores are trimmed from both halves: `default__10min` would
 /// contain a double underscore and trip rustc's `non_snake_case` lint.
 fn default_fn_name(struct_name: &str, field_ident: &str) -> String {
-    format!(
+    let name = format!(
         "default_{}_{}",
         to_snake_case(struct_name).trim_start_matches('_'),
         field_ident.trim_start_matches('_')
-    )
+    );
+    assert_ident(&name).to_string()
 }
 
 /// Escape a spec string for use inside a Rust string literal.
@@ -171,7 +172,7 @@ type DefaultLiterals = std::collections::HashMap<(String, String), String>;
 
 /// Render the Rust literal for every field default up front. Fields whose
 /// default cannot be represented are omitted and reported once as a Degraded
-/// diagnostic — the single source for both `model.rs` (whether to emit
+/// diagnostic, the single source for both `model.rs` (whether to emit
 /// `#[serde(default)]`) and `default.rs` (the function body).
 fn compute_default_literals(
     entities: &[Entity],
@@ -215,7 +216,7 @@ fn compute_default_literals(
 /// Only an inline enum needs resolving: its `rust_type` is the unprefixed enum
 /// name, which [`resolve_inline_enums`] maps to the deduplicated, struct-
 /// prefixed name. Every other `rust_type` is already a real type name and is
-/// returned untouched — looking it up in the map would rewrite a `$ref` field
+/// returned untouched: looking it up in the map would rewrite a `$ref` field
 /// whose target schema happens to share an inline enum's name.
 fn resolved_type(struct_name: &str, field: &Field, enum_name_map: &EnumNameMap) -> String {
     if !field.is_inline_enum {
@@ -539,7 +540,7 @@ fn write_default_rs(
         };
         for field in &s.fields {
             // Skip fields with no default, and those whose default could not be
-            // rendered (absent from the map — already reported in `write`).
+            // rendered (absent from the map, already reported in `write`).
             let Some(literal) = default_literals.get(&(s.name.clone(), field.name.clone())) else {
                 continue;
             };
@@ -733,7 +734,7 @@ fn write_error_push(out: &mut String, indent: &str, fmt_str: &str, args: &str) -
 /// Returns true when this constraint produces exactly one `if`-style check that
 /// clippy would flag as collapsible with an outer `if let Some`.
 fn is_single_collapsible_check(constraints: &Constraints) -> bool {
-    // VecNested emits a `for` loop, Array unique_items emits a block — neither is collapsible.
+    // VecNested emits a `for` loop, Array unique_items emits a block; neither is collapsible.
     let non_collapsible = matches!(constraints, Constraints::VecNested)
         || matches!(
             constraints,
@@ -1307,7 +1308,7 @@ mod tests {
     }
 
     /// A `pattern` containing brace quantifiers (e.g. `{1,14}`) must have its
-    /// braces doubled in the `format!` error-message literal — but NOT in the
+    /// braces doubled in the `format!` error-message literal, but NOT in the
     /// `Regex::new(...)` argument, where doubling would corrupt the regex.
     #[test]
     fn write_pattern_with_brace_quantifier() -> Result {

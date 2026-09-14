@@ -13,7 +13,7 @@ src/diagnostic.rs   # Diagnostic and Severity: what the generator could not repr
 src/error.rs        # Error type, including the fatal-diagnostic abort
 src/lib.rs          # Public API (parse, write, generate), domain types, integration tests
 src/main.rs         # CLI (clap)
-tests/              # Behavior of the whole tool: --strict, naming aborts, logging contract
+tests/              # CLI behavior: --strict, naming aborts, files written or not
 examples/           # Example crate, its openapi.yaml, and the generated output (committed)
 justfile            # All common tasks, read this first
 ```
@@ -99,8 +99,7 @@ diagnostic and error strings, replies to a prompt.
 ## Testing
 
 - Unit tests live next to the code in `src/*.rs`, integration tests in `src/lib.rs` (they drive
-  `generate` end to end) and in `tests/` (`collision_cli` and `strict_cli` drive the binary,
-  `logging` drives the library).
+  `generate` end to end) and in `tests/` (they drive the CLI binary).
 - Assert against whole generated blocks, not single lines. One raw string holding a struct or an
   enum reads as "this is the code we generate" and catches field order and attributes too. Tests
   written before this rule still assert line by line; convert them when you touch them.

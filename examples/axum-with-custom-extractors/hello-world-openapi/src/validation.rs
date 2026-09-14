@@ -1,4 +1,4 @@
-// This file is @generated — do not edit manually.
+// This file is @generated. Do not edit manually.
 
 use crate::model::*;
 use regex::Regex;
