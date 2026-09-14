@@ -49,15 +49,53 @@ A member reached *directly* (a field typed with it rather than with the union) t
 
 Members of a discriminated union must be `$ref`s to local object schemas. A member that names a non-object schema is dropped, because serde's internally tagged representation requires each payload to serialize as a map.
 
+### Naming
+
+Schema names, property names and enum values are arbitrary spec strings, and most of them are not legal Rust identifiers. They are converted to the Rust casing of their kind (`PascalCase` types and variants, `snake_case` fields, so the generated crate is free of `non_snake_case` and `non_camel_case_types` warnings) and sanitized before being emitted. The original string is put back with a `#[serde(rename)]`, so the wire format is unchanged:
+
+| Spec | Generated |
+| --- | --- |
+| enum value `10min` | variant `Variant10min` (a leading digit cannot open an identifier) |
+| enum value `with space`, `a.b` | variant `WithSpace`, `AB` |
+| property `firstName`, `first-name` | field `first_name` |
+| property `HTTPProxyURL` | field `http_proxy_url` |
+| property `type` | field `r#type` (no rename needed, serde strips the `r#`) |
+| property `self` | field `self_` (`self` cannot be a raw identifier) |
+| schema `3d-model` | type `Type3dModel` |
+
+Sanitizing loses nothing (the value is still on the wire), so it is not reported.
+
+Two naming cases are fatal:
+
+- A spec name with **nothing to build on** (the enum value `""`, a property or schema named `"!!!"` or `"_"`) leaves nothing to derive from.
+- A name **collision**: Two enum values can sanitize to the same variant (`a.b` and `a-b` both give `AB`, and so do `10min` and a literal `Variant10min`), as can two properties of one struct (`first-name` and `first.name`) or two schema names (`foo-bar` and `foo_bar`).
+
+```
+error: code generation failed: 3 fatal problems in the spec
+
+  Series.odd
+    enum values "a.b" and "a-b" would both become the Rust enum variant `AB`
+
+  Series.resolution
+    enum values "10min" and "Variant10min" would both become the Rust enum variant `Variant10min`
+
+  Series.kind
+    enum value "" has nothing a Rust name can be built from
+
+Fix the spec, then re-run. No files were written.
+```
+
+A **`$ref` that resolves to no type** is fatal for the same reason, one step removed: the field would name a Rust type that nothing defines. That covers a `$ref` to a schema that is not in the spec, and a `$ref` to one that generated nothing (an `allOf` schema, or a `oneOf` whose members were all dropped). External `$ref`s are excluded, since they are unsupported by design and already carry their own diagnostic.
+
 ### Limitations / not yet supported
 
 - **Inline / field-level `oneOf`**: a `oneOf` used directly as a property's schema (rather than a named schema under `components/schemas`) is not generated as a typed enum — the field falls back to `serde_json::Value`.
 - **Non-`$ref` members of a `oneOf`**: inline-object members of a top-level `oneOf` are skipped; only `$ref`s to local schemas become variants. Members whose target schema was itself not generated, or whose name collides with another variant, are dropped too.
-- **`anyOf` / `allOf`**: not supported. Schemas using them are dropped (top-level) or degrade to `serde_json::Value` (as a field).
+- **`anyOf` / `allOf`**: not supported. Schemas using them are dropped (top-level) or degrade to `serde_json::Value` (as an inline field schema). A `$ref` *to* such a schema is fatal, see [Naming](#naming).
 - **Untagged union cardinality is not enforced**: an untagged `oneOf` (no discriminator) deserializes to the first matching variant; the "exactly one match" rule is not validated at runtime.
 - **Request/response bodies, `additionalProperties` (maps), header/cookie parameters, non-local `$ref`s, and non-object/non-string-enum top-level schemas** are not generated.
 
-None of these are silent: every construct that is dropped or degraded is reported as a **diagnostic**. The CLI prints a summary to stderr after generation, and library callers get the full list in `GeneratedCrate.diagnostics`.
+None of these are silent: every construct that is dropped or degraded is reported as a **diagnostic**. The CLI prints a summary to stderr after generation, and library callers get the full list in `GeneratedCrate.diagnostics`. A *fatal* diagnostic (see [Naming](#naming)) is different in kind: it aborts generation, so it arrives as an error rather than in that list.
 
 Pass `--strict` to make the CLI exit non-zero (code 2) when *anything* was not fully generated — degraded as well as dropped. Degrading still loses information, and some degradations (an external `$ref`, say) leave code that will not compile, so a CI gate for lossless generation has to treat both as failures. Files are always written; only the exit code changes.
 
