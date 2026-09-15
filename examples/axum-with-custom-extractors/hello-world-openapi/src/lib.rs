@@ -1,6 +1,6 @@
 // This file is @generated. Do not edit manually.
 
-mod default;
+pub mod default;
 mod model;
 mod validation;
 
