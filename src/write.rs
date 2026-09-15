@@ -151,11 +151,16 @@ fn field_ident(struct_name: &str, field: &Field, field_idents: &FieldIdents) -> 
 
 /// Name of the generated `default.rs` function for a field.
 ///
-/// Leading underscores are trimmed from both halves: `default__10min` would
-/// contain a double underscore and trip rustc's `non_snake_case` lint.
+/// The name is the struct and the field, with no `default_` prefix: the
+/// `default::` module path the caller writes already says what it returns.
+///
+/// Leading underscores are trimmed from both halves: `series__10min` would
+/// contain a double underscore and trip rustc's `non_snake_case` lint. The
+/// struct half opens the name, and a type identifier never starts with a
+/// digit, so the name stays a valid identifier without the prefix.
 fn default_fn_name(struct_name: &str, field_ident: &str) -> String {
     let name = format!(
-        "default_{}_{}",
+        "{}_{}",
         to_snake_case(struct_name).trim_start_matches('_'),
         field_ident.trim_start_matches('_')
     );
