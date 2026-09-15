@@ -6,7 +6,14 @@ types, with serde derives, `Validation` impls, and default functions.
 ## Repo Structure
 
 ```
-src/parse.rs        # OpenAPI -> Entity (structs, enums, unions), records diagnostics
+src/parse/          # OpenAPI -> Entity (structs, enums, unions), records diagnostics
+  mod.rs            #   entry point, the Parser collector, $ref helpers
+  schema.rs         #   components/schemas -> structs and enums, the type map
+  one_of.rs         #   top-level oneOf -> unions, and the pass that prunes them
+  operation.rs      #   everything under paths: query parameters, operation bodies
+  default.rs        #   whether a field's `default` can be emitted, and as what
+  constraint.rs     #   validation keywords -> Constraints
+  testutil.rs       #   spec fixtures shared by the parser's test modules
 src/write.rs        # Entity -> generated crate (model.rs, validation.rs, default.rs, Cargo.toml)
 src/ident.rs        # Spec strings -> Rust identifiers, the single place that names anything
 src/diagnostic.rs   # Diagnostic and Severity: what the generator could not represent
