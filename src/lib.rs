@@ -660,18 +660,18 @@ components:
 
         // serde attributes should reference crate::default::
         assert!(
-            model.contains(r#"#[serde(default = "crate::default::default_config_name")]"#),
+            model.contains(r#"#[serde(default = "crate::default::config_name")]"#),
             "missing serde default attr for name: {model}"
         );
         assert!(
-            model.contains(r#"#[serde(default = "crate::default::default_config_count")]"#),
+            model.contains(r#"#[serde(default = "crate::default::config_count")]"#),
             "missing serde default attr for count: {model}"
         );
 
         // default.rs should exist with functions
         let defaults = file_content(&crate_, "src/default.rs");
         assert!(
-            defaults.contains("pub fn default_config_name() -> String"),
+            defaults.contains("pub fn config_name() -> String"),
             "missing default fn for name: {defaults}"
         );
         assert!(
@@ -679,7 +679,7 @@ components:
             "missing default literal for name: {defaults}"
         );
         assert!(
-            defaults.contains("pub fn default_config_count() -> i32"),
+            defaults.contains("pub fn config_count() -> i32"),
             "missing default fn for count: {defaults}"
         );
         assert!(
@@ -687,7 +687,7 @@ components:
             "missing default literal for count: {defaults}"
         );
         assert!(
-            defaults.contains("pub fn default_config_rate() -> f64"),
+            defaults.contains("pub fn config_rate() -> f64"),
             "missing default fn for rate: {defaults}"
         );
         assert!(
@@ -695,7 +695,7 @@ components:
             "missing default literal for rate: {defaults}"
         );
         assert!(
-            defaults.contains("pub fn default_config_enabled() -> bool"),
+            defaults.contains("pub fn config_enabled() -> bool"),
             "missing default fn for enabled: {defaults}"
         );
 
@@ -737,7 +737,7 @@ components:
 
         let defaults = file_content(&crate_, "src/default.rs");
         assert!(
-            defaults.contains("pub fn default_foo_label() -> Option<String>"),
+            defaults.contains("pub fn foo_label() -> Option<String>"),
             "return type should be Option: {defaults}"
         );
         assert!(
@@ -782,7 +782,7 @@ components:
         let defaults = file_content(&crate_, "src/default.rs");
 
         assert!(
-            defaults.contains("pub fn default_event_created_at() -> DateTime<Utc>"),
+            defaults.contains("pub fn event_created_at() -> DateTime<Utc>"),
             "missing DateTime default fn: {defaults}"
         );
         assert!(
@@ -790,7 +790,7 @@ components:
             "missing DateTime parse: {defaults}"
         );
         assert!(
-            defaults.contains("pub fn default_event_event_date() -> NaiveDate"),
+            defaults.contains("pub fn event_event_date() -> NaiveDate"),
             "missing NaiveDate default fn: {defaults}"
         );
         assert!(
@@ -800,7 +800,7 @@ components:
             "missing NaiveDate parse: {defaults}"
         );
         assert!(
-            defaults.contains("pub fn default_event_event_id() -> Uuid"),
+            defaults.contains("pub fn event_event_id() -> Uuid"),
             "missing Uuid default fn: {defaults}"
         );
         assert!(
@@ -847,7 +847,7 @@ components:
         let defaults = file_content(&crate_, "src/default.rs");
 
         assert!(
-            defaults.contains("pub fn default_greeting_language() -> GreetingLanguage"),
+            defaults.contains("pub fn greeting_language() -> GreetingLanguage"),
             "missing enum default fn: {defaults}"
         );
         assert!(
@@ -944,15 +944,13 @@ components:
             "query param with default should be promoted: {model}"
         );
         assert!(
-            model.contains(
-                r#"#[serde(default = "crate::default::default_get_things_query_limit")]"#
-            ),
+            model.contains(r#"#[serde(default = "crate::default::get_things_query_limit")]"#),
             "missing serde default attr: {model}"
         );
 
         let defaults = file_content(&crate_, "src/default.rs");
         assert!(
-            defaults.contains("pub fn default_get_things_query_limit() -> i32"),
+            defaults.contains("pub fn get_things_query_limit() -> i32"),
             "missing default fn for query param: {defaults}"
         );
 
@@ -1517,7 +1515,7 @@ components:
             model.contains(
                 r##"pub struct Series {
     #[serde(rename = "10min")]
-    #[serde(default = "crate::default::default_series_10min")]
+    #[serde(default = "crate::default::series_10min")]
     pub _10min: String,
     #[serde(rename = "first-name")]
     pub first_name: Option<String>,
@@ -1533,7 +1531,7 @@ components:
         let defaults = file_content(&crate_, "src/default.rs");
         assert!(
             defaults.contains(
-                r#"pub fn default_series_10min() -> String {
+                r#"pub fn series_10min() -> String {
     String::from("x")
 }"#
             ),

@@ -9,7 +9,7 @@ Given an OpenAPI spec, `openapi-modelgen` produces a self-contained Rust crate w
 - **`Cargo.toml`**: package manifest with all required dependencies
 - **`src/lib.rs`**: module declarations and re-exports
 - **`src/model.rs`**: Rust structs derived from `components/schemas` (with `Serialize` + `Deserialize`) and query parameter structs from path operations (with `Deserialize`)
-- **`src/default.rs`**: a public `default_*` function for every spec `default`, written only when the spec has one. `#[serde(default)]` calls it, and so can you when you build a struct by hand.
+- **`src/default.rs`**: a public function for every spec `default`, written only when the spec has one.
 - **`src/validation.rs`**: a `Validation` trait with `validate()` implementations that enforce OpenAPI constraints at runtime
 
 ### Supported features

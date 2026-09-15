@@ -43,7 +43,7 @@ pub struct Greeting {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateGreetingRequest {
     pub message: String,
-    #[serde(default = "crate::default::default_create_greeting_request_language")]
+    #[serde(default = "crate::default::create_greeting_request_language")]
     pub language: GreetingLanguage,
     pub expires_on: Option<NaiveDate>,
     pub tags: Option<Vec<String>>,
@@ -76,6 +76,6 @@ pub struct LinkAttachment {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ListGreetingsQuery {
     pub language: Option<String>,
-    #[serde(default = "crate::default::default_list_greetings_query_limit")]
+    #[serde(default = "crate::default::list_greetings_query_limit")]
     pub limit: i32,
 }
