@@ -4,10 +4,14 @@ version = "0.1.8"
 edition = "2024"
 
 [dependencies]
+# chrono and uuid parse `default` values at generation time, so a malformed one
+# fails the run instead of panicking inside the generated crate.
+chrono = "0.4"
 clap = { version = "4", features = ["derive"] }
 openapiv3 = "2"
 serde_json = "1"
 serde_yaml = "0.9"
+uuid = "1"
 
 [dev-dependencies]
 pretty_assertions = "1"

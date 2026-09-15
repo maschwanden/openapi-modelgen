@@ -1185,10 +1185,11 @@ components:
     Foo:
       type: object
       properties:
-        count:
-          type: integer
-          format: int32
-          default: 1.5
+        tags:
+          type: array
+          items:
+            type: string
+          default: ["a"]
 "#;
         let crate_ = generate(&load_spec(yaml)?, &test_config())?;
 
@@ -1282,6 +1283,46 @@ components:
             crate_.diagnostics.is_empty(),
             "expected no diagnostics, got {:?}",
             crate_.diagnostics
+        );
+
+        Ok(())
+    }
+
+    /// A `default` that contradicts its own type aborts the run, and the
+    /// message names every offending property at once so one pass over the
+    /// spec fixes them all.
+    #[test]
+    fn mismatched_defaults_abort_generation() -> Result<()> {
+        let yaml = r#"
+openapi: "3.0.3"
+info:
+  title: Test
+  version: "0.1.0"
+paths: {}
+components:
+  schemas:
+    Reading:
+      type: object
+      properties:
+        count:
+          type: integer
+          default: 1.5
+        takenAt:
+          type: string
+          format: date-time
+          default: "yesterday"
+"#;
+        assert_eq!(
+            spec_error(yaml),
+            r#"2 fatal problems in the spec
+
+  Reading.count
+    default value 1.5 is not valid for type `i64`: not an integer
+
+  Reading.takenAt
+    default value "yesterday" is not valid for type `DateTime<Utc>`: not an RFC 3339 date-time
+
+Fix the spec, then re-run. No files were written."#
         );
 
         Ok(())
