@@ -34,16 +34,13 @@ pub fn write(entities: &[Entity], config: &Config) -> Result<GeneratedCrate, std
 
     // Resolve every field's Rust identifier once: model.rs, default.rs and
     // validation.rs must all spell the same field the same way.
-    let (field_idents, mut diagnostics) = resolve_field_idents(entities);
+    let (field_idents, diagnostics) = resolve_field_idents(entities);
     // Render every field default once; both model.rs and default.rs consume the
-    // result, and unrenderable defaults are reported here (a single site).
-    let (default_literals, mut default_diagnostics) =
-        compute_default_literals(entities, &enum_name_map);
-    diagnostics.append(&mut default_diagnostics);
+    // result.
+    let default_literals = compute_default_literals(entities, &enum_name_map);
 
-    // Keyed off the rendered literals, not off `default_value`: a default the
-    // spec declares but the writer cannot render produces no function, so
-    // emitting `default.rs` for it would leave an empty module behind.
+    // A spec with no usable default writes no `default.rs`, so the module
+    // declaration in lib.rs is conditional too.
     let needs_defaults = !default_literals.is_empty();
 
     let mut files = vec![
@@ -173,20 +170,19 @@ fn escape_literal(s: &str) -> String {
 }
 
 /// Rendered default-value literals keyed by `(struct name, field name)`.
-/// A missing key means the field has no default, or its default could not be
-/// rendered (reported once by [`compute_default_literals`]).
+/// A missing key means the field has no default.
 type DefaultLiterals = std::collections::HashMap<(String, String), String>;
 
-/// Render the Rust literal for every field default up front. Fields whose
-/// default cannot be represented are omitted and reported once as a Degraded
-/// diagnostic, the single source for both `model.rs` (whether to emit
-/// `#[serde(default)]`) and `default.rs` (the function body).
-fn compute_default_literals(
-    entities: &[Entity],
-    enum_name_map: &EnumNameMap,
-) -> (DefaultLiterals, Vec<Diagnostic>) {
+/// Render the Rust literal for every field default up front, the single source
+/// for both `model.rs` (whether to emit `#[serde(default)]`) and `default.rs`
+/// (the function body).
+///
+/// Every default reaching here was passed by `parse::classify_default`, which
+/// only keeps what this can render. A failure is therefore a generator bug, and
+/// panicking says so: the alternative is a field that silently loses its
+/// `#[serde(default)]` and becomes required on the wire.
+fn compute_default_literals(entities: &[Entity], enum_name_map: &EnumNameMap) -> DefaultLiterals {
     let mut literals = DefaultLiterals::new();
-    let mut diagnostics = Vec::new();
     for entity in entities {
         let Entity::Struct(s) = entity else { continue };
         for field in &s.fields {
@@ -196,26 +192,23 @@ fn compute_default_literals(
             // The enum the default has to name a variant of, if this is an
             // inline enum field. `rust_type` is the enum's unprefixed name.
             let enum_def = s.enums.iter().find(|e| e.name == field.rust_type);
-            match format_default_literal(
+            let literal = format_default_literal(
                 default_val,
                 field,
                 &resolved_type(&s.name, field, enum_name_map),
                 enum_def,
-            ) {
-                Some(literal) => {
-                    literals.insert((s.name.clone(), field.name.clone()), literal);
-                }
-                None => record(
-                    &mut diagnostics,
-                    Severity::Degraded,
-                    format!("{}.{}", s.name, field.name),
-                    "default value",
-                    "default value could not be rendered as a Rust literal; no `#[serde(default)]` was emitted",
-                ),
-            }
+            )
+            .unwrap_or_else(|| {
+                panic!(
+                    "generator bug: default {default_val} for `{}.{}` passed parse::classify_default \
+                     but has no Rust literal for type `{}`",
+                    s.name, field.name, field.rust_type
+                )
+            });
+            literals.insert((s.name.clone(), field.name.clone()), literal);
         }
     }
-    (literals, diagnostics)
+    literals
 }
 
 /// The Rust type name a field is emitted with, before `Option` wrapping.
@@ -467,7 +460,7 @@ fn format_default_literal(
         }
         // Inline enum: the variant name is looked up rather than re-derived, so
         // a default can never name a variant the enum does not have. `parse`
-        // has already reported a default that is not one of the enum's values.
+        // has already rejected a default that is not one of the enum's values.
         (serde_json::Value::String(s), _) if field.is_inline_enum => {
             let variant = enum_def?
                 .variants

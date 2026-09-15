@@ -86,6 +86,22 @@ error: code generation failed: 3 fatal problems in the spec
 Fix the spec, then re-run. No files were written.
 ```
 
+A **`default` that its own type cannot hold** is fatal too, for the same reason turned around: there is no honest output. `default: 1.5` on an `integer`, `default: "not-a-date"` on a `date-time`, a value that overflows `int32`, or an `enum` default that is not one of the enum's values. Writing the default would put a value in the crate that the type cannot represent, and ignoring it would make the field required, which the spec never said. The run stops instead, naming every offending property at once:
+
+```
+error: code generation failed: 2 fatal problems in the spec
+
+  Reading.count
+    default value 1.5 is not valid for type `i64`: not an integer
+
+  Reading.takenAt
+    default value "yesterday" is not valid for type `DateTime<Utc>`: not an RFC 3339 date-time
+
+Fix the spec, then re-run. No files were written.
+```
+
+A `default` the type *can* hold but the generator cannot write is a different case, and only degrades. See [Limitations](#limitations--not-yet-supported).
+
 A **`$ref` that resolves to no type** is fatal for the same reason, one step removed: the field would name a Rust type that nothing defines. That covers a `$ref` to a schema that is not in the spec, and a `$ref` to one that generated nothing (an `allOf` schema, or a `oneOf` whose members were all dropped). External `$ref`s are excluded, since they are unsupported by design and already carry their own diagnostic.
 
 ### Limitations / not yet supported
@@ -95,7 +111,7 @@ A **`$ref` that resolves to no type** is fatal for the same reason, one step rem
 - **`anyOf` / `allOf`**: not supported. Schemas using them are dropped (top-level) or degrade to `serde_json::Value` (as an inline field schema). A `$ref` *to* such a schema is fatal, see [Naming](#naming).
 - **Untagged union cardinality is not enforced**: an untagged `oneOf` (no discriminator) deserializes to the first matching variant; the "exactly one match" rule is not validated at runtime.
 - **`required` and `nullable` are collapsed into one flag**: any field that is not `required`, or is `nullable`, becomes `Option<T>`. "Absent" and "explicitly null" are therefore indistinguishable, a `required` + `nullable` field is not enforced as present (serde reads a missing `Option` as `None`), and a `None` is always written back as `null`, including for a field the spec declares non-`nullable`.
-- **A `default` that cannot be rendered leaves a mandatory field**: a `default` makes a non-`required` field bare `T` with `#[serde(default)]`. When the value survives the parse check but has no Rust literal (a fractional `default` on an `integer`, say), the `#[serde(default)]` is dropped while the field stays bare, so a field the spec marks optional is required on the wire. Reported as a diagnostic.
+- **An array `default` is ignored**: a `default` the generator cannot write as a Rust literal is dropped and the field keeps its `Option<T>`. That covers an array default (`default: ["a"]`) and a default on a field whose type already degraded to `serde_json::Value`. Reported as a diagnostic.
 - **Request/response bodies, `additionalProperties` (maps), header/cookie parameters, non-local `$ref`s, and non-object/non-string-enum top-level schemas** are not generated.
 
 None of these are silent: every construct that is dropped or degraded is reported as a **diagnostic**. The CLI prints a summary to stderr after generation, and library callers get the full list in `GeneratedCrate.diagnostics`. A *fatal* diagnostic (see [Naming](#naming)) is different in kind: it aborts generation, so it arrives as an error rather than in that list.
