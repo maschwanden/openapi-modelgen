@@ -557,7 +557,7 @@ fn write_default_rs(
             };
             let fn_name = default_fn_name(&s.name, &ident);
             writeln!(out)?;
-            writeln!(out, "pub(crate) fn {fn_name}() -> {return_type} {{")?;
+            writeln!(out, "pub fn {fn_name}() -> {return_type} {{")?;
             writeln!(out, "    {literal}")?;
             writeln!(out, "}}")?;
         }
@@ -1216,7 +1216,11 @@ pretty_assertions = \"1\"
 
 fn generate_lib_rs(needs_defaults: bool) -> String {
     let header = header_comment();
-    let default_mod = if needs_defaults { "mod default;\n" } else { "" };
+    let default_mod = if needs_defaults {
+        "pub mod default;\n"
+    } else {
+        ""
+    };
     format!(
         "\
 // {header}

@@ -9,6 +9,7 @@ Given an OpenAPI spec, `openapi-modelgen` produces a self-contained Rust crate w
 - **`Cargo.toml`**: package manifest with all required dependencies
 - **`src/lib.rs`**: module declarations and re-exports
 - **`src/model.rs`**: Rust structs derived from `components/schemas` (with `Serialize` + `Deserialize`) and query parameter structs from path operations (with `Deserialize`)
+- **`src/default.rs`**: a public `default_*` function for every spec `default`, written only when the spec has one. `#[serde(default)]` calls it, and so can you when you build a struct by hand.
 - **`src/validation.rs`**: a `Validation` trait with `validate()` implementations that enforce OpenAPI constraints at runtime
 
 ### Supported features
@@ -93,6 +94,8 @@ A **`$ref` that resolves to no type** is fatal for the same reason, one step rem
 - **Non-`$ref` members of a `oneOf`**: inline-object members of a top-level `oneOf` are skipped; only `$ref`s to local schemas become variants. Members whose target schema was itself not generated, or whose name collides with another variant, are dropped too.
 - **`anyOf` / `allOf`**: not supported. Schemas using them are dropped (top-level) or degrade to `serde_json::Value` (as an inline field schema). A `$ref` *to* such a schema is fatal, see [Naming](#naming).
 - **Untagged union cardinality is not enforced**: an untagged `oneOf` (no discriminator) deserializes to the first matching variant; the "exactly one match" rule is not validated at runtime.
+- **`required` and `nullable` are collapsed into one flag**: any field that is not `required`, or is `nullable`, becomes `Option<T>`. "Absent" and "explicitly null" are therefore indistinguishable, a `required` + `nullable` field is not enforced as present (serde reads a missing `Option` as `None`), and a `None` is always written back as `null`, including for a field the spec declares non-`nullable`.
+- **A `default` that cannot be rendered leaves a mandatory field**: a `default` makes a non-`required` field bare `T` with `#[serde(default)]`. When the value survives the parse check but has no Rust literal (a fractional `default` on an `integer`, say), the `#[serde(default)]` is dropped while the field stays bare, so a field the spec marks optional is required on the wire. Reported as a diagnostic.
 - **Request/response bodies, `additionalProperties` (maps), header/cookie parameters, non-local `$ref`s, and non-object/non-string-enum top-level schemas** are not generated.
 
 None of these are silent: every construct that is dropped or degraded is reported as a **diagnostic**. The CLI prints a summary to stderr after generation, and library callers get the full list in `GeneratedCrate.diagnostics`. A *fatal* diagnostic (see [Naming](#naming)) is different in kind: it aborts generation, so it arrives as an error rather than in that list.

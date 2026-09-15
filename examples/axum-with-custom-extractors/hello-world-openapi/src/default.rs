@@ -2,10 +2,10 @@
 
 use crate::model::*;
 
-pub(crate) fn default_create_greeting_request_language() -> GreetingLanguage {
+pub fn default_create_greeting_request_language() -> GreetingLanguage {
     GreetingLanguage::En
 }
 
-pub(crate) fn default_list_greetings_query_limit() -> i32 {
+pub fn default_list_greetings_query_limit() -> i32 {
     20
 }

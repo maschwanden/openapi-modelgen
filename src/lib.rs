@@ -671,7 +671,7 @@ components:
         // default.rs should exist with functions
         let defaults = file_content(&crate_, "src/default.rs");
         assert!(
-            defaults.contains("pub(crate) fn default_config_name() -> String"),
+            defaults.contains("pub fn default_config_name() -> String"),
             "missing default fn for name: {defaults}"
         );
         assert!(
@@ -679,7 +679,7 @@ components:
             "missing default literal for name: {defaults}"
         );
         assert!(
-            defaults.contains("pub(crate) fn default_config_count() -> i32"),
+            defaults.contains("pub fn default_config_count() -> i32"),
             "missing default fn for count: {defaults}"
         );
         assert!(
@@ -687,7 +687,7 @@ components:
             "missing default literal for count: {defaults}"
         );
         assert!(
-            defaults.contains("pub(crate) fn default_config_rate() -> f64"),
+            defaults.contains("pub fn default_config_rate() -> f64"),
             "missing default fn for rate: {defaults}"
         );
         assert!(
@@ -695,14 +695,14 @@ components:
             "missing default literal for rate: {defaults}"
         );
         assert!(
-            defaults.contains("pub(crate) fn default_config_enabled() -> bool"),
+            defaults.contains("pub fn default_config_enabled() -> bool"),
             "missing default fn for enabled: {defaults}"
         );
 
         // lib.rs should include mod default
         let lib = file_content(&crate_, "src/lib.rs");
         assert!(
-            lib.contains("mod default;"),
+            lib.contains("pub mod default;"),
             "lib.rs should include default module: {lib}"
         );
 
@@ -737,7 +737,7 @@ components:
 
         let defaults = file_content(&crate_, "src/default.rs");
         assert!(
-            defaults.contains("pub(crate) fn default_foo_label() -> Option<String>"),
+            defaults.contains("pub fn default_foo_label() -> Option<String>"),
             "return type should be Option: {defaults}"
         );
         assert!(
@@ -782,7 +782,7 @@ components:
         let defaults = file_content(&crate_, "src/default.rs");
 
         assert!(
-            defaults.contains("pub(crate) fn default_event_created_at() -> DateTime<Utc>"),
+            defaults.contains("pub fn default_event_created_at() -> DateTime<Utc>"),
             "missing DateTime default fn: {defaults}"
         );
         assert!(
@@ -790,7 +790,7 @@ components:
             "missing DateTime parse: {defaults}"
         );
         assert!(
-            defaults.contains("pub(crate) fn default_event_event_date() -> NaiveDate"),
+            defaults.contains("pub fn default_event_event_date() -> NaiveDate"),
             "missing NaiveDate default fn: {defaults}"
         );
         assert!(
@@ -800,7 +800,7 @@ components:
             "missing NaiveDate parse: {defaults}"
         );
         assert!(
-            defaults.contains("pub(crate) fn default_event_event_id() -> Uuid"),
+            defaults.contains("pub fn default_event_event_id() -> Uuid"),
             "missing Uuid default fn: {defaults}"
         );
         assert!(
@@ -847,7 +847,7 @@ components:
         let defaults = file_content(&crate_, "src/default.rs");
 
         assert!(
-            defaults.contains("pub(crate) fn default_greeting_language() -> GreetingLanguage"),
+            defaults.contains("pub fn default_greeting_language() -> GreetingLanguage"),
             "missing enum default fn: {defaults}"
         );
         assert!(
@@ -952,7 +952,7 @@ components:
 
         let defaults = file_content(&crate_, "src/default.rs");
         assert!(
-            defaults.contains("pub(crate) fn default_get_things_query_limit() -> i32"),
+            defaults.contains("pub fn default_get_things_query_limit() -> i32"),
             "missing default fn for query param: {defaults}"
         );
 
@@ -1533,7 +1533,7 @@ components:
         let defaults = file_content(&crate_, "src/default.rs");
         assert!(
             defaults.contains(
-                r#"pub(crate) fn default_series_10min() -> String {
+                r#"pub fn default_series_10min() -> String {
     String::from("x")
 }"#
             ),
