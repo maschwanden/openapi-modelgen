@@ -2,222 +2,240 @@
 
 use openapiv3::{Operation, ReferenceOr};
 
-use super::{Parser, constraint::extract_constraints};
+use super::{
+    constraint::extract_constraints, default::extract_default, schema::resolve_schema_ref,
+};
 use crate::{
-    Constraints, Entity, EntityKind, Field, StructDef,
-    diagnostic::Severity,
+    Constraints, Diagnostic, Entity, EntityKind, Field, StructDef,
+    diagnostic::{Severity, record},
     ident::{to_pascal_case, to_type_ident},
 };
 
-impl Parser {
-    pub(super) fn parse_query(
-        &mut self,
-        op: &Operation,
-        components: Option<&openapiv3::Components>,
-        method: &str,
-        path: &str,
-    ) -> Option<Entity> {
-        let location = format!("{} {path}", method.to_uppercase());
+pub(super) fn parse_query(
+    op: &Operation,
+    components: Option<&openapiv3::Components>,
+    method: &str,
+    path: &str,
+) -> (Option<Entity>, Vec<Diagnostic>) {
+    let location = format!("{} {path}", method.to_uppercase());
 
-        let mut query_params = Vec::new();
-        for p in &op.parameters {
-            let param = match p {
-                ReferenceOr::Item(param) => param,
-                ReferenceOr::Reference { reference } => {
-                    match resolve_parameter_ref(reference, components) {
-                        Some(param) => param,
-                        None => {
-                            self.record(
-                                Severity::Dropped,
-                                location.clone(),
-                                "$ref parameter",
-                                format!(
-                                    "could not resolve parameter $ref `{reference}`; parameter dropped"
-                                ),
-                            );
-                            continue;
-                        }
+    let mut diagnostics = Vec::new();
+    let mut query_params = Vec::new();
+    for p in &op.parameters {
+        let param = match p {
+            ReferenceOr::Item(param) => param,
+            ReferenceOr::Reference { reference } => {
+                match resolve_parameter_ref(reference, components) {
+                    Some(param) => param,
+                    None => {
+                        record(
+                            &mut diagnostics,
+                            Severity::Dropped,
+                            location.clone(),
+                            "$ref parameter",
+                            format!(
+                                "could not resolve parameter $ref `{reference}`; parameter dropped"
+                            ),
+                        );
+                        continue;
                     }
                 }
-            };
-            match param {
-                openapiv3::Parameter::Query { .. } => query_params.push(param),
-                // Path parameters live in the URL, not the query struct: excluded by design.
-                openapiv3::Parameter::Path { .. } => {}
-                openapiv3::Parameter::Header { parameter_data, .. } => self.record(
-                    Severity::Dropped,
-                    format!("{location}#{}", parameter_data.name),
-                    "header parameter",
-                    "header parameters are not generated",
-                ),
-                openapiv3::Parameter::Cookie { parameter_data, .. } => self.record(
-                    Severity::Dropped,
-                    format!("{location}#{}", parameter_data.name),
-                    "cookie parameter",
-                    "cookie parameters are not generated",
-                ),
             }
+        };
+        match param {
+            openapiv3::Parameter::Query { .. } => query_params.push(param),
+            // Path parameters live in the URL, not the query struct: excluded by design.
+            openapiv3::Parameter::Path { .. } => {}
+            openapiv3::Parameter::Header { parameter_data, .. } => record(
+                &mut diagnostics,
+                Severity::Dropped,
+                format!("{location}#{}", parameter_data.name),
+                "header parameter",
+                "header parameters are not generated",
+            ),
+            openapiv3::Parameter::Cookie { parameter_data, .. } => record(
+                &mut diagnostics,
+                Severity::Dropped,
+                format!("{location}#{}", parameter_data.name),
+                "cookie parameter",
+                "cookie parameters are not generated",
+            ),
         }
+    }
 
-        if query_params.is_empty() {
-            return None;
-        }
+    // The parameters already reported are a loss whether or not a struct comes
+    // out of this operation, so they leave with the `None` too.
+    if query_params.is_empty() {
+        return (None, diagnostics);
+    }
 
-        // An operationId that yields no name falls back to the path, which always
-        // starts with the HTTP method and so always yields one.
-        let struct_name = op
-            .operation_id
-            .as_deref()
-            .and_then(to_type_ident)
-            .unwrap_or_else(|| query_name_from_path(method, path))
-            + "Query";
+    // An operationId that yields no name falls back to the path, which always
+    // starts with the HTTP method and so always yields one.
+    let struct_name = op
+        .operation_id
+        .as_deref()
+        .and_then(to_type_ident)
+        .unwrap_or_else(|| query_name_from_path(method, path))
+        + "Query";
 
-        let mut fields = Vec::new();
+    let mut fields = Vec::new();
 
-        for param in &query_params {
-            let data = parameter_data(param);
-            let param_path = format!("{location}#{}", data.name);
-            let openapiv3::ParameterSchemaOrContent::Schema(schema_ref) = &data.format else {
-                self.record(
-                    Severity::Dropped,
-                    param_path,
-                    "content parameter",
-                    "parameter uses `content` instead of `schema`; not generated",
-                );
-                continue;
-            };
-            let (rust_type, nullable) = self.resolve_schema_ref(schema_ref, &param_path);
+    for param in &query_params {
+        let data = parameter_data(param);
+        let param_path = format!("{location}#{}", data.name);
+        let openapiv3::ParameterSchemaOrContent::Schema(schema_ref) = &data.format else {
+            record(
+                &mut diagnostics,
+                Severity::Dropped,
+                param_path,
+                "content parameter",
+                "parameter uses `content` instead of `schema`; not generated",
+            );
+            continue;
+        };
+        let (rust_type, nullable, reported) = resolve_schema_ref(schema_ref, &param_path);
+        diagnostics.extend(reported);
 
-            let default_value = match schema_ref {
-                ReferenceOr::Item(schema) => {
-                    self.extract_default(&schema.schema_data.default, &rust_type, None, &param_path)
-                }
-                ReferenceOr::Reference { .. } => None,
-            };
+        let default_value = match schema_ref {
+            ReferenceOr::Item(schema) => {
+                let (value, reported) =
+                    extract_default(&schema.schema_data.default, &rust_type, None, &param_path);
+                diagnostics.extend(reported);
+                value
+            }
+            ReferenceOr::Reference { .. } => None,
+        };
 
-            let has_default = default_value.is_some();
-            let is_optional = if has_default {
-                nullable
-            } else {
-                !data.required || nullable
-            };
+        let has_default = default_value.is_some();
+        let is_optional = if has_default {
+            nullable
+        } else {
+            !data.required || nullable
+        };
 
-            let constraints = match schema_ref {
-                ReferenceOr::Reference { .. } => Constraints::Nested,
-                ReferenceOr::Item(schema) => extract_constraints(schema),
-            };
+        let constraints = match schema_ref {
+            ReferenceOr::Reference { .. } => Constraints::Nested,
+            ReferenceOr::Item(schema) => extract_constraints(schema),
+        };
 
-            fields.push(Field {
-                name: data.name.clone(),
-                rust_type,
-                ref_target: match schema_ref {
-                    ReferenceOr::Reference { reference } => Some(reference.clone()),
-                    ReferenceOr::Item(_) => None,
-                },
-                is_optional,
-                constraints,
-                default_value,
-                // Query parameters never generate inline enums.
-                is_inline_enum: false,
-            });
-        }
+        fields.push(Field {
+            name: data.name.clone(),
+            rust_type,
+            ref_target: match schema_ref {
+                ReferenceOr::Reference { reference } => Some(reference.clone()),
+                ReferenceOr::Item(_) => None,
+            },
+            is_optional,
+            constraints,
+            default_value,
+            // Query parameters never generate inline enums.
+            is_inline_enum: false,
+        });
+    }
 
+    (
         Some(Entity::Struct(StructDef {
             name: struct_name,
             kind: EntityKind::Query,
             fields,
             enums: Vec::new(),
-        }))
-    }
+        })),
+        diagnostics,
+    )
+}
 
-    /// Record diagnostics for operation request/response bodies, which are never
-    /// parsed into types.
-    ///
-    /// A body is a loss only when its content schema is *inline*; a `$ref` content
-    /// schema points at a component we do generate. `$ref` bodies/responses are
-    /// resolved against `components`, then the same inline check applies: an
-    /// unresolvable `$ref` (external or missing) is itself a genuine loss.
-    pub(super) fn diagnose_operation_bodies(
-        &mut self,
-        op: &Operation,
-        components: Option<&openapiv3::Components>,
-        method: &str,
-        path: &str,
-    ) {
-        let location = format!("{} {path}", method.to_uppercase());
+/// Report operation request/response bodies, which are never parsed into types.
+///
+/// A body is a loss only when its content schema is *inline*; a `$ref` content
+/// schema points at a component we do generate. `$ref` bodies/responses are
+/// resolved against `components`, then the same inline check applies: an
+/// unresolvable `$ref` (external or missing) is itself a genuine loss.
+pub(super) fn diagnose_operation_bodies(
+    op: &Operation,
+    components: Option<&openapiv3::Components>,
+    method: &str,
+    path: &str,
+) -> Vec<Diagnostic> {
+    let location = format!("{} {path}", method.to_uppercase());
+    let mut diagnostics = Vec::new();
 
-        // Request body: a loss only when its content schema is inline. A `$ref`
-        // body is resolved first; an unresolvable `$ref` is itself a loss.
-        if let Some(ref_or) = &op.request_body {
-            let resolved = match ref_or {
-                ReferenceOr::Item(body) => Some(body),
-                ReferenceOr::Reference { reference } => {
-                    let body = resolve_request_body(reference, components);
-                    if body.is_none() {
-                        self.record(
-                            Severity::Dropped,
-                            location.clone(),
-                            "request body",
-                            format!("could not resolve request body $ref `{reference}`"),
-                        );
-                    }
-                    body
+    // Request body: a loss only when its content schema is inline. A `$ref`
+    // body is resolved first; an unresolvable `$ref` is itself a loss.
+    if let Some(ref_or) = &op.request_body {
+        let resolved = match ref_or {
+            ReferenceOr::Item(body) => Some(body),
+            ReferenceOr::Reference { reference } => {
+                let body = resolve_request_body(reference, components);
+                if body.is_none() {
+                    record(
+                        &mut diagnostics,
+                        Severity::Dropped,
+                        location.clone(),
+                        "request body",
+                        format!("could not resolve request body $ref `{reference}`"),
+                    );
                 }
-            };
-            if let Some(body) = resolved
-                && content_has_inline_schema(body.content.values())
-            {
-                self.record(
-                    Severity::Dropped,
-                    location.clone(),
-                    "request body",
-                    "inline request body schema is not generated as a named type",
-                );
+                body
             }
-        }
-
-        // Responses (every status plus the `default` response). Each status is
-        // reported separately so the diagnostic names the response that was lost.
-        let by_status = op
-            .responses
-            .responses
-            .iter()
-            .map(|(status, response_ref)| (status.to_string(), response_ref))
-            .chain(
-                op.responses
-                    .default
-                    .iter()
-                    .map(|response_ref| ("default".to_string(), response_ref)),
+        };
+        if let Some(body) = resolved
+            && content_has_inline_schema(body.content.values())
+        {
+            record(
+                &mut diagnostics,
+                Severity::Dropped,
+                location.clone(),
+                "request body",
+                "inline request body schema is not generated as a named type",
             );
-        for (status, response_ref) in by_status {
-            let response_path = format!("{location}#{status}");
-            let resolved = match response_ref {
-                ReferenceOr::Item(response) => Some(response),
-                ReferenceOr::Reference { reference } => {
-                    let response = resolve_response(reference, components);
-                    if response.is_none() {
-                        self.record(
-                            Severity::Dropped,
-                            response_path.clone(),
-                            "response body",
-                            format!("could not resolve response $ref `{reference}`"),
-                        );
-                    }
-                    response
-                }
-            };
-            if let Some(response) = resolved
-                && content_has_inline_schema(response.content.values())
-            {
-                self.record(
-                    Severity::Dropped,
-                    response_path,
-                    "response body",
-                    "inline response body schema is not generated as a named type",
-                );
-            }
         }
     }
+
+    // Responses (every status plus the `default` response). Each status is
+    // reported separately so the diagnostic names the response that was lost.
+    let by_status = op
+        .responses
+        .responses
+        .iter()
+        .map(|(status, response_ref)| (status.to_string(), response_ref))
+        .chain(
+            op.responses
+                .default
+                .iter()
+                .map(|response_ref| ("default".to_string(), response_ref)),
+        );
+    for (status, response_ref) in by_status {
+        let response_path = format!("{location}#{status}");
+        let resolved = match response_ref {
+            ReferenceOr::Item(response) => Some(response),
+            ReferenceOr::Reference { reference } => {
+                let response = resolve_response(reference, components);
+                if response.is_none() {
+                    record(
+                        &mut diagnostics,
+                        Severity::Dropped,
+                        response_path.clone(),
+                        "response body",
+                        format!("could not resolve response $ref `{reference}`"),
+                    );
+                }
+                response
+            }
+        };
+        if let Some(response) = resolved
+            && content_has_inline_schema(response.content.values())
+        {
+            record(
+                &mut diagnostics,
+                Severity::Dropped,
+                response_path,
+                "response body",
+                "inline response body schema is not generated as a named type",
+            );
+        }
+    }
+
+    diagnostics
 }
 
 /// Extract the common `ParameterData` from any parameter variant (query, header, path, cookie).

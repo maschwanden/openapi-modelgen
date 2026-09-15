@@ -4,221 +4,232 @@ use std::collections::HashSet;
 
 use openapiv3::{ReferenceOr, Schema, SchemaKind};
 
-use super::{Parser, is_local_schema_ref, resolve_ref_name};
+use super::{is_local_schema_ref, resolve_ref_name};
 use crate::{
-    Entity, UnionDef, UnionVariant,
+    Diagnostic, Entity, UnionDef, UnionVariant,
     diagnostic::{Severity, record},
     ident::to_type_ident,
 };
 
-impl Parser {
-    /// Post-pass that makes every `oneOf` union sound.
-    ///
-    /// [`parse_one_of`] sees one schema at a time, so it cannot tell whether a
-    /// member `$ref` names a type that was actually generated, nor what shape that
-    /// type has. With the full entity list this pass:
-    ///
-    /// * drops variants whose member produced no type (e.g. an `allOf` schema),
-    ///   which would otherwise reference a nonexistent Rust type;
-    /// * drops non-struct variants of a *tagged* union, since serde's internally tagged
-    ///   representation requires each payload to serialize as a map, and a variant
-    ///   wrapping an enum or scalar silently round-trips to garbage;
-    /// * drops variants whose PascalCase name collides with an earlier one, which
-    ///   would emit a duplicate enum variant;
-    /// * removes the discriminator property from every member struct of a tagged
-    ///   union (see [`strip_discriminator_properties`]);
-    /// * removes a union left with no usable variants at all.
-    pub(super) fn resolve_unions(&mut self, entities: &mut Vec<Entity>) {
-        let mut struct_names = HashSet::new();
-        let mut generated_names = HashSet::new();
-        for entity in entities.iter() {
-            match entity {
-                Entity::Struct(s) => {
-                    struct_names.insert(s.name.clone());
-                    generated_names.insert(s.name.clone());
+/// Post-pass that makes every `oneOf` union sound.
+///
+/// [`parse_one_of`] sees one schema at a time, so it cannot tell whether a
+/// member `$ref` names a type that was actually generated, nor what shape that
+/// type has. With the full entity list this pass:
+///
+/// * drops variants whose member produced no type (e.g. an `allOf` schema),
+///   which would otherwise reference a nonexistent Rust type;
+/// * drops non-struct variants of a *tagged* union, since serde's internally tagged
+///   representation requires each payload to serialize as a map, and a variant
+///   wrapping an enum or scalar silently round-trips to garbage;
+/// * drops variants whose PascalCase name collides with an earlier one, which
+///   would emit a duplicate enum variant;
+/// * removes the discriminator property from every member struct of a tagged
+///   union (see [`strip_discriminator_properties`]);
+/// * removes a union left with no usable variants at all.
+pub(super) fn resolve_unions(entities: &mut Vec<Entity>) -> Vec<Diagnostic> {
+    let mut struct_names = HashSet::new();
+    let mut generated_names = HashSet::new();
+    for entity in entities.iter() {
+        match entity {
+            Entity::Struct(s) => {
+                struct_names.insert(s.name.clone());
+                generated_names.insert(s.name.clone());
+            }
+            Entity::Enum(e) => {
+                generated_names.insert(e.name.clone());
+            }
+            Entity::Union(u) => {
+                generated_names.insert(u.name.clone());
+            }
+        }
+    }
+
+    let mut diagnostics = Vec::new();
+    // Unions that already got a per-member diagnostic; if such a union ends up
+    // empty, the member reports explain it and a schema-level drop would just
+    // restate them.
+    let mut reported = HashSet::new();
+    // `(member type, discriminator property)` pairs to strip afterwards.
+    let mut tags_to_strip = Vec::new();
+
+    for entity in entities.iter_mut() {
+        let Entity::Union(union_def) = entity else {
+            continue;
+        };
+        let path = format!("components.schemas.{}", union_def.name);
+        let tagged = union_def.tag.is_some();
+
+        let mut seen = HashSet::new();
+        let mut kept = Vec::new();
+        for variant in std::mem::take(&mut union_def.variants) {
+            let drop_reason = if !generated_names.contains(&variant.inner_type) {
+                Some(format!(
+                    "member `{}` has no generated type; the variant was dropped",
+                    variant.inner_type
+                ))
+            } else if tagged && !struct_names.contains(&variant.inner_type) {
+                Some(format!(
+                    "member `{}` is not an object schema, so a discriminated union cannot wrap it; the variant was dropped",
+                    variant.inner_type
+                ))
+            } else if !seen.insert(variant.variant_name.clone()) {
+                Some(format!(
+                    "member `{}` maps to variant `{}`, which is already taken; the variant was dropped",
+                    variant.inner_type, variant.variant_name
+                ))
+            } else {
+                None
+            };
+
+            match drop_reason {
+                Some(reason) => {
+                    reported.insert(union_def.name.clone());
+                    record(
+                        &mut diagnostics,
+                        Severity::Dropped,
+                        path.clone(),
+                        "oneOf member",
+                        reason,
+                    );
                 }
-                Entity::Enum(e) => {
-                    generated_names.insert(e.name.clone());
-                }
-                Entity::Union(u) => {
-                    generated_names.insert(u.name.clone());
-                }
+                None => kept.push(variant),
             }
         }
 
-        // Unions that already got a per-member diagnostic; if such a union ends up
-        // empty, the member reports explain it and a schema-level drop would just
-        // restate them.
-        let mut reported = HashSet::new();
-        // `(member type, discriminator property)` pairs to strip afterwards.
-        let mut tags_to_strip = Vec::new();
-
-        for entity in entities.iter_mut() {
-            let Entity::Union(union_def) = entity else {
-                continue;
-            };
-            let path = format!("components.schemas.{}", union_def.name);
-            let tagged = union_def.tag.is_some();
-
-            let mut seen = HashSet::new();
-            let mut kept = Vec::new();
-            for variant in std::mem::take(&mut union_def.variants) {
-                let drop_reason = if !generated_names.contains(&variant.inner_type) {
-                    Some(format!(
-                        "member `{}` has no generated type; the variant was dropped",
-                        variant.inner_type
-                    ))
-                } else if tagged && !struct_names.contains(&variant.inner_type) {
-                    Some(format!(
-                        "member `{}` is not an object schema, so a discriminated union cannot wrap it; the variant was dropped",
-                        variant.inner_type
-                    ))
-                } else if !seen.insert(variant.variant_name.clone()) {
-                    Some(format!(
-                        "member `{}` maps to variant `{}`, which is already taken; the variant was dropped",
-                        variant.inner_type, variant.variant_name
-                    ))
-                } else {
-                    None
-                };
-
-                match drop_reason {
-                    Some(reason) => {
-                        reported.insert(union_def.name.clone());
-                        self.record(Severity::Dropped, path.clone(), "oneOf member", reason);
-                    }
-                    None => kept.push(variant),
-                }
+        if let Some(tag) = &union_def.tag {
+            for variant in &kept {
+                tags_to_strip.push((variant.inner_type.clone(), tag.clone()));
             }
-
-            if let Some(tag) = &union_def.tag {
-                for variant in &kept {
-                    tags_to_strip.push((variant.inner_type.clone(), tag.clone()));
-                }
-            }
-            union_def.variants = kept;
         }
+        union_def.variants = kept;
+    }
 
-        strip_discriminator_properties(entities, &tags_to_strip);
+    strip_discriminator_properties(entities, &tags_to_strip);
 
-        entities.retain(|entity| {
-            let Entity::Union(union_def) = entity else {
-                return true;
-            };
-            if !union_def.variants.is_empty() {
-                return true;
-            }
-            if !reported.contains(&union_def.name) {
-                self.record(
-                    Severity::Dropped,
-                    format!("components.schemas.{}", union_def.name),
-                    "oneOf",
-                    "no member of the oneOf produced a usable variant; no type was generated",
-                );
-            }
-            false
+    entities.retain(|entity| {
+        let Entity::Union(union_def) = entity else {
+            return true;
+        };
+        if !union_def.variants.is_empty() {
+            return true;
+        }
+        if !reported.contains(&union_def.name) {
+            record(
+                &mut diagnostics,
+                Severity::Dropped,
+                format!("components.schemas.{}", union_def.name),
+                "oneOf",
+                "no member of the oneOf produced a usable variant; no type was generated",
+            );
+        }
+        false
+    });
+
+    diagnostics
+}
+
+/// Parse a top-level `oneOf` schema into a union entity.
+///
+/// Each member is expected to be a `$ref` to a local component schema; each
+/// becomes an enum variant wrapping the referenced type. Inline (non-`$ref`)
+/// and non-local members are out of scope, so they are skipped. If a
+/// `discriminator` is present the union is internally tagged, and every variant
+/// gets a wire value: the `mapping` key when one points at the member,
+/// otherwise the member's schema name, which is what OpenAPI implies.
+///
+/// Members that survive here are still only *candidates*: whether the
+/// referenced type exists and has a usable shape is settled by
+/// [`resolve_unions`], which sees the whole entity list.
+///
+/// Per-member skip diagnostics are returned with the union, so they reach the
+/// caller only when a union is actually produced (a mix of usable variants and
+/// skipped members). If *no* variant survives, the `None` takes them with it and
+/// the single schema-level drop in [`super::schema::diagnose_unsupported_schema`]
+/// fires instead, which avoids a double report for the same schema.
+pub(super) fn parse_one_of(name: &str, schema: &Schema) -> Option<(Entity, Vec<Diagnostic>)> {
+    let SchemaKind::OneOf { one_of } = &schema.schema_kind else {
+        return None;
+    };
+    let union_name = to_type_ident(name)?;
+
+    let path = format!("components.schemas.{name}");
+    let discriminator = schema.schema_data.discriminator.as_ref();
+
+    let mut variants = Vec::new();
+    let mut diagnostics = Vec::new();
+    for member in one_of {
+        let ReferenceOr::Reference { reference } = member else {
+            record(
+                &mut diagnostics,
+                Severity::Dropped,
+                path.clone(),
+                "inline oneOf member",
+                "inline (non-$ref) oneOf members are not supported; this variant was skipped",
+            );
+            continue;
+        };
+        // A non-local $ref has no generated type and no valid Rust name; using
+        // it would emit the raw ref string as an identifier.
+        if !is_local_schema_ref(reference) {
+            record(
+                &mut diagnostics,
+                Severity::Dropped,
+                path.clone(),
+                "external oneOf member",
+                format!(
+                    "oneOf member $ref `{reference}` is not a local component schema; the variant was dropped"
+                ),
+            );
+            continue;
+        }
+        let ref_name = resolve_ref_name(reference);
+        // The schema name is the wire value; the Rust type derives from it.
+        let Some(type_name) = to_type_ident(&ref_name) else {
+            record(
+                &mut diagnostics,
+                Severity::Dropped,
+                path.clone(),
+                "oneOf member",
+                format!(
+                    "member `{ref_name}` has nothing a Rust name can be built from; \
+                     the variant was dropped"
+                ),
+            );
+            continue;
+        };
+
+        // A discriminator mapping key overrides the wire value; without one,
+        // OpenAPI uses the member's schema name, which is not necessarily the
+        // PascalCase variant name, so it still has to be recorded.
+        let wire_value = discriminator.map(|d| {
+            d.mapping
+                .iter()
+                .find_map(|(key, target)| {
+                    (resolve_ref_name(target) == ref_name).then(|| key.clone())
+                })
+                .unwrap_or_else(|| ref_name.clone())
+        });
+
+        variants.push(UnionVariant {
+            variant_name: type_name.clone(),
+            inner_type: type_name,
+            wire_value,
         });
     }
 
-    /// Parse a top-level `oneOf` schema into a union entity.
-    ///
-    /// Each member is expected to be a `$ref` to a local component schema; each
-    /// becomes an enum variant wrapping the referenced type. Inline (non-`$ref`)
-    /// and non-local members are out of scope, so they are skipped. If a
-    /// `discriminator` is present the union is internally tagged, and every variant
-    /// gets a wire value: the `mapping` key when one points at the member,
-    /// otherwise the member's schema name, which is what OpenAPI implies.
-    ///
-    /// Members that survive here are still only *candidates*: whether the
-    /// referenced type exists and has a usable shape is settled by
-    /// [`resolve_unions`], which sees the whole entity list.
-    ///
-    /// Per-member skip diagnostics are buffered and only flushed when a union is
-    /// actually produced (a mix of usable variants and skipped members). If *no*
-    /// variant survives, nothing is recorded here so the single schema-level drop in
-    /// `diagnose_unsupported_schema` fires instead, avoiding a double report for
-    /// the same schema.
-    pub(super) fn parse_one_of(&mut self, name: &str, schema: &Schema) -> Option<Entity> {
-        let SchemaKind::OneOf { one_of } = &schema.schema_kind else {
-            return None;
-        };
+    if variants.is_empty() {
+        return None;
+    }
 
-        let path = format!("components.schemas.{name}");
-        let discriminator = schema.schema_data.discriminator.as_ref();
-
-        let mut variants = Vec::new();
-        let mut skipped = Vec::new();
-        for member in one_of {
-            let ReferenceOr::Reference { reference } = member else {
-                record(
-                    &mut skipped,
-                    Severity::Dropped,
-                    path.clone(),
-                    "inline oneOf member",
-                    "inline (non-$ref) oneOf members are not supported; this variant was skipped",
-                );
-                continue;
-            };
-            // A non-local $ref has no generated type and no valid Rust name; using
-            // it would emit the raw ref string as an identifier.
-            if !is_local_schema_ref(reference) {
-                record(
-                    &mut skipped,
-                    Severity::Dropped,
-                    path.clone(),
-                    "external oneOf member",
-                    format!(
-                        "oneOf member $ref `{reference}` is not a local component schema; the variant was dropped"
-                    ),
-                );
-                continue;
-            }
-            let ref_name = resolve_ref_name(reference);
-            // The schema name is the wire value; the Rust type derives from it.
-            let Some(type_name) = to_type_ident(&ref_name) else {
-                record(
-                    &mut skipped,
-                    Severity::Dropped,
-                    path.clone(),
-                    "oneOf member",
-                    format!(
-                        "member `{ref_name}` has nothing a Rust name can be built from; \
-                         the variant was dropped"
-                    ),
-                );
-                continue;
-            };
-
-            // A discriminator mapping key overrides the wire value; without one,
-            // OpenAPI uses the member's schema name, which is not necessarily the
-            // PascalCase variant name, so it still has to be recorded.
-            let wire_value = discriminator.map(|d| {
-                d.mapping
-                    .iter()
-                    .find_map(|(key, target)| {
-                        (resolve_ref_name(target) == ref_name).then(|| key.clone())
-                    })
-                    .unwrap_or_else(|| ref_name.clone())
-            });
-
-            variants.push(UnionVariant {
-                variant_name: type_name.clone(),
-                inner_type: type_name,
-                wire_value,
-            });
-        }
-
-        if variants.is_empty() {
-            return None;
-        }
-
-        self.diagnostics.append(&mut skipped);
-        Some(Entity::Union(UnionDef {
-            name: to_type_ident(name)?,
+    Some((
+        Entity::Union(UnionDef {
+            name: union_name,
             variants,
             tag: discriminator.map(|d| d.property_name.clone()),
-        }))
-    }
+        }),
+        diagnostics,
+    ))
 }
 
 /// Remove each tagged union's discriminator property from its member structs.

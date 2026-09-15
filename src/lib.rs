@@ -290,7 +290,7 @@ pub fn generate(spec: &OpenAPI, config: &Config) -> Result<GeneratedCrate> {
     let (entities, mut diagnostics) = parse(spec);
     let mut generated = write(&entities, config)?;
     // Parse-time diagnostics come first (spec order), then write-time ones.
-    diagnostics.append(&mut generated.diagnostics);
+    diagnostics.extend(std::mem::take(&mut generated.diagnostics));
     generated.diagnostics = diagnostics;
 
     // A fatal diagnostic means two spec names want one Rust name. Every other
