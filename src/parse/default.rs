@@ -1,50 +1,46 @@
 //! A field's `default` value: whether the generator can emit it, and as what.
 
-use super::Parser;
-use crate::diagnostic::Severity;
+use crate::{Diagnostic, diagnostic::Severity};
 
-impl Parser {
-    /// Take a field's `default`, if the generator can emit it.
-    ///
-    /// `enum_values` holds the spec values of the field's inline enum, and is
-    /// `None` for every other field. `context` is the field's spec location,
-    /// where a rejected default is reported.
-    pub(super) fn extract_default(
-        &mut self,
-        raw: &Option<serde_json::Value>,
-        rust_type: &str,
-        enum_values: Option<&[String]>,
-        context: &str,
-    ) -> Option<serde_json::Value> {
-        let value = raw.as_ref()?;
-        match classify_default(value, rust_type, enum_values) {
-            DefaultVerdict::Usable => Some(value.clone()),
-            DefaultVerdict::Unrenderable => {
-                self.record(
-                    Severity::Degraded,
-                    context.to_string(),
-                    "default value",
-                    format!(
-                        "default value {value} ignored (type `{rust_type}` does not support code-generated defaults)"
-                    ),
-                );
-                None
-            }
-            DefaultVerdict::Mismatch(reason) => {
-                self.record(
-                    Severity::Fatal,
-                    context.to_string(),
-                    "default value",
-                    format!("default value {value} {reason}"),
-                );
-                None
-            }
-        }
+/// Take a field's `default`, if the generator can emit it.
+///
+/// `enum_values` holds the spec values of the field's inline enum, and is
+/// `None` for every other field. `context` is the field's spec location,
+/// where a rejected default is reported.
+pub(super) fn extract_default(
+    raw: &Option<serde_json::Value>,
+    rust_type: &str,
+    enum_values: Option<&[String]>,
+    context: &str,
+) -> (Option<serde_json::Value>, Vec<Diagnostic>) {
+    let Some(value) = raw.as_ref() else {
+        return (None, Vec::new());
+    };
+    match classify_default(value, rust_type, enum_values) {
+        DefaultVerdict::Usable => (Some(value.clone()), Vec::new()),
+        DefaultVerdict::Unrenderable => (
+            None,
+            vec![Diagnostic::new(
+                Severity::Degraded,
+                context,
+                "default value",
+                format!(
+                    "default value {value} ignored (type `{rust_type}` does not support code-generated defaults)"
+                ),
+            )],
+        ),
+        DefaultVerdict::Mismatch(reason) => (
+            None,
+            vec![Diagnostic::new(
+                Severity::Fatal,
+                context,
+                "default value",
+                format!("default value {value} {reason}"),
+            )],
+        ),
     }
 }
 
-/// Check whether a JSON default value can be represented as a Rust literal
-/// for the given type. Inline enum fields pass `is_enum = true`.
 /// What the generator can do with a `default` value.
 enum DefaultVerdict {
     /// The value fits the field's type, and [`crate::write`] has a literal for it.

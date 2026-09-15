@@ -6,343 +6,383 @@ use openapiv3::{
     IntegerFormat, ReferenceOr, Schema, SchemaKind, StringFormat, Type, VariantOrUnknownOrEmpty,
 };
 
-use super::{Parser, constraint::extract_constraints};
+use super::{
+    constraint::extract_constraints, default::extract_default, diagnose_ref, ref_type_name,
+};
 use crate::{
-    Constraints, Entity, EntityKind, EnumDef, Field, StructDef,
-    diagnostic::Severity,
+    Constraints, Diagnostic, Entity, EntityKind, EnumDef, Field, StructDef,
+    diagnostic::{Severity, record},
     ident::{to_type_ident, to_variant_ident},
 };
 
-impl Parser {
-    pub(super) fn parse_schema(&mut self, name: &str, schema: &Schema) -> Option<Entity> {
-        let SchemaKind::Type(Type::Object(obj)) = &schema.schema_kind else {
-            return None;
-        };
+pub(super) fn parse_schema(name: &str, schema: &Schema) -> Option<(Entity, Vec<Diagnostic>)> {
+    let SchemaKind::Type(Type::Object(obj)) = &schema.schema_kind else {
+        return None;
+    };
+    // Derived before anything is reported: a schema with no Rust name produces
+    // no struct, and returning one here would take its diagnostics with it.
+    let type_name = to_type_ident(name)?;
 
-        // A map-shaped object (`additionalProperties` with an empty property set) is
-        // generated as an empty struct, silently dropping the map value type.
-        if has_meaningful_additional_properties(obj) {
-            self.record(
-                Severity::Degraded,
-                format!("components.schemas.{name}"),
-                "additionalProperties",
-                "additionalProperties is ignored; map values are not represented in the generated struct",
-            );
-        }
+    let mut diagnostics = Vec::new();
 
-        let mut fields = Vec::new();
-        let mut enums = Vec::new();
+    // A map-shaped object (`additionalProperties` with an empty property set) is
+    // generated as an empty struct, silently dropping the map value type.
+    if has_meaningful_additional_properties(obj) {
+        record(
+            &mut diagnostics,
+            Severity::Degraded,
+            format!("components.schemas.{name}"),
+            "additionalProperties",
+            "additionalProperties is ignored; map values are not represented in the generated struct",
+        );
+    }
 
-        for (field_name, field_ref) in &obj.properties {
-            let required = obj.required.contains(field_name);
-            let context = format!("{name}.{field_name}");
+    let mut fields = Vec::new();
+    let mut enums = Vec::new();
 
-            // Check for inline string enums. `is_inline_enum` is recorded per field
-            // rather than re-derived from the name later: a `$ref` field pointing at
-            // a schema that happens to share an inline enum's name is NOT an enum
-            // field, and conflating the two silently mistypes it.
-            let (rust_type, nullable, is_inline_enum) = match field_ref {
-                ReferenceOr::Item(field_schema) => {
-                    if let Some(enum_def) = self.parse_enum(field_name, field_schema, &context) {
+    for (field_name, field_ref) in &obj.properties {
+        let required = obj.required.contains(field_name);
+        let context = format!("{name}.{field_name}");
+
+        // Check for inline string enums. `is_inline_enum` is recorded per field
+        // rather than re-derived from the name later: a `$ref` field pointing at
+        // a schema that happens to share an inline enum's name is NOT an enum
+        // field, and conflating the two silently mistypes it.
+        let (rust_type, nullable, is_inline_enum) = match field_ref {
+            ReferenceOr::Item(field_schema) => {
+                match parse_enum(field_name, field_schema, &context) {
+                    Some((enum_def, reported)) => {
+                        diagnostics.extend(reported);
                         let ty = enum_def.name.clone();
                         let nullable = field_schema.schema_data.nullable;
                         enums.push(enum_def);
                         (ty, nullable, true)
-                    } else {
-                        let (ty, nullable) = self.map_schema_to_type(field_schema, &context);
+                    }
+                    None => {
+                        let (ty, nullable, reported) = map_schema_to_type(field_schema, &context);
+                        diagnostics.extend(reported);
                         (ty, nullable, false)
                     }
                 }
-                ReferenceOr::Reference { .. } => {
-                    let (ty, nullable) = self.resolve_field_type(field_ref, &context);
-                    (ty, nullable, false)
-                }
-            };
+            }
+            ReferenceOr::Reference { .. } => {
+                let (ty, nullable, reported) = resolve_field_type(field_ref, &context);
+                diagnostics.extend(reported);
+                (ty, nullable, false)
+            }
+        };
 
-            // An inline enum's values are what its default has to name.
-            let enum_values: Option<Vec<String>> = is_inline_enum.then(|| {
-                enums
-                    .last()
-                    .map(|e| {
-                        e.variants
-                            .iter()
-                            .map(|(_, original)| original.clone())
-                            .collect()
-                    })
-                    .unwrap_or_default()
-            });
+        // An inline enum's values are what its default has to name.
+        let enum_values: Option<Vec<String>> = is_inline_enum.then(|| {
+            enums
+                .last()
+                .map(|e| {
+                    e.variants
+                        .iter()
+                        .map(|(_, original)| original.clone())
+                        .collect()
+                })
+                .unwrap_or_default()
+        });
 
-            let default_value = match field_ref {
-                ReferenceOr::Item(field_schema) => self.extract_default(
+        let default_value = match field_ref {
+            ReferenceOr::Item(field_schema) => {
+                let (value, reported) = extract_default(
                     &field_schema.schema_data.default,
                     &rust_type,
                     enum_values.as_deref(),
                     &context,
-                ),
-                ReferenceOr::Reference { .. } => None,
-            };
+                );
+                diagnostics.extend(reported);
+                value
+            }
+            ReferenceOr::Reference { .. } => None,
+        };
 
-            let has_default = default_value.is_some();
-            let is_optional = if has_default {
-                nullable
-            } else {
-                !required || nullable
-            };
+        let has_default = default_value.is_some();
+        let is_optional = if has_default {
+            nullable
+        } else {
+            !required || nullable
+        };
 
-            // If the field was converted to an enum type, serde handles validation,
-            // no runtime constraints needed.
-            let constraints = if is_inline_enum {
-                Constraints::None
-            } else {
-                match field_ref {
-                    ReferenceOr::Reference { .. } => Constraints::Nested,
-                    ReferenceOr::Item(field_schema) => {
-                        if let SchemaKind::Type(Type::Array(arr)) = &field_schema.schema_kind {
-                            if let Some(ReferenceOr::Reference { .. }) = &arr.items {
-                                Constraints::VecNested
-                            } else {
-                                extract_constraints(field_schema)
-                            }
+        // If the field was converted to an enum type, serde handles validation,
+        // no runtime constraints needed.
+        let constraints = if is_inline_enum {
+            Constraints::None
+        } else {
+            match field_ref {
+                ReferenceOr::Reference { .. } => Constraints::Nested,
+                ReferenceOr::Item(field_schema) => {
+                    if let SchemaKind::Type(Type::Array(arr)) = &field_schema.schema_kind {
+                        if let Some(ReferenceOr::Reference { .. }) = &arr.items {
+                            Constraints::VecNested
                         } else {
                             extract_constraints(field_schema)
                         }
+                    } else {
+                        extract_constraints(field_schema)
                     }
                 }
-            };
+            }
+        };
 
-            fields.push(Field {
-                name: field_name.clone(),
-                rust_type,
-                ref_target: field_ref_target(field_ref),
-                is_optional,
-                constraints,
-                default_value,
-                is_inline_enum,
-            });
-        }
+        fields.push(Field {
+            name: field_name.clone(),
+            rust_type,
+            ref_target: field_ref_target(field_ref),
+            is_optional,
+            constraints,
+            default_value,
+            is_inline_enum,
+        });
+    }
 
-        Some(Entity::Struct(StructDef {
-            name: to_type_ident(name)?,
+    Some((
+        Entity::Struct(StructDef {
+            name: type_name,
             kind: EntityKind::Schema,
             fields,
             enums,
-        }))
+        }),
+        diagnostics,
+    ))
+}
+
+/// If the schema is a string with enum values, generate an EnumDef.
+///
+/// Enum values are arbitrary strings (`10min`, `a.b`, `""`), so every variant
+/// name goes through [`to_variant_ident`]; the original value is kept for the
+/// `#[serde(rename)]` that preserves the wire format.
+///
+/// Sanitizing can map two distinct values onto one name: `a.b` and `a-b` both
+/// give `AB`, and a value that needed the `Variant` prefix can land on one that
+/// spells it out (`10min` and `Variant10min`). There is no good answer at that
+/// point: dropping a value makes it undeserializable, and suffixing one puts a
+/// variant in the generated API that appears nowhere in the spec, so the
+/// collision is [`Severity::Fatal`] and generation fails. The colliding variant
+/// is still emitted (uncompilable rather than quietly wrong) for callers that
+/// go through [`super::parse`] and ignore diagnostics.
+pub(super) fn parse_enum(
+    name: &str,
+    schema: &Schema,
+    context: &str,
+) -> Option<(EnumDef, Vec<Diagnostic>)> {
+    let SchemaKind::Type(Type::String(s)) = &schema.schema_kind else {
+        return None;
+    };
+    let values: Vec<String> = s.enumeration.iter().filter_map(Clone::clone).collect();
+    if values.is_empty() {
+        return None;
+    }
+    // Derived before the values are walked, for the reason given in
+    // [`parse_schema`]: no name means no enum, and no enum means no reports.
+    let enum_name = to_type_ident(name)?;
+
+    let mut diagnostics = Vec::new();
+    let mut seen_values = HashSet::new();
+    // Variant name → the first value that claimed it, for the collision report.
+    let mut taken_names: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    let mut variants: Vec<(String, String)> = Vec::new();
+    for value in values {
+        // A repeated value would emit two variants renamed to the same string,
+        // which serde rejects at compile time.
+        if !seen_values.insert(value.clone()) {
+            record(
+                &mut diagnostics,
+                Severity::Dropped,
+                context,
+                "enum value",
+                format!("value `{value}` is listed twice; the repeat was dropped"),
+            );
+            continue;
+        }
+
+        let Some(variant) = to_variant_ident(&value) else {
+            record(
+                &mut diagnostics,
+                Severity::Fatal,
+                context,
+                "enum value",
+                format!("enum value \"{value}\" has nothing a Rust name can be built from"),
+            );
+            continue;
+        };
+        if let Some(first) = taken_names.get(&variant) {
+            record(
+                &mut diagnostics,
+                Severity::Fatal,
+                context,
+                "enum value",
+                format!(
+                    "enum values \"{first}\" and \"{value}\" would both become \
+                     the Rust enum variant `{variant}`"
+                ),
+            );
+        } else {
+            taken_names.insert(variant.clone(), value.clone());
+        }
+        variants.push((variant, value));
     }
 
-    /// If the schema is a string with enum values, generate an EnumDef.
-    ///
-    /// Enum values are arbitrary strings (`10min`, `a.b`, `""`), so every variant
-    /// name goes through [`to_variant_ident`]; the original value is kept for the
-    /// `#[serde(rename)]` that preserves the wire format.
-    ///
-    /// Sanitizing can map two distinct values onto one name: `a.b` and `a-b` both
-    /// give `AB`, and a value that needed the `Variant` prefix can land on one that
-    /// spells it out (`10min` and `Variant10min`). There is no good answer at that
-    /// point: dropping a value makes it undeserializable, and suffixing one puts a
-    /// variant in the generated API that appears nowhere in the spec, so the
-    /// collision is [`Severity::Fatal`] and generation fails. The colliding variant
-    /// is still emitted (uncompilable rather than quietly wrong) for callers that
-    /// go through [`parse`] and ignore diagnostics.
-    pub(super) fn parse_enum(
-        &mut self,
-        name: &str,
-        schema: &Schema,
-        context: &str,
-    ) -> Option<EnumDef> {
-        let SchemaKind::Type(Type::String(s)) = &schema.schema_kind else {
-            return None;
-        };
-        let values: Vec<String> = s.enumeration.iter().filter_map(Clone::clone).collect();
-        if values.is_empty() {
-            return None;
-        }
-
-        let mut seen_values = HashSet::new();
-        // Variant name → the first value that claimed it, for the collision report.
-        let mut taken_names: std::collections::HashMap<String, String> =
-            std::collections::HashMap::new();
-        let mut variants: Vec<(String, String)> = Vec::new();
-        for value in values {
-            // A repeated value would emit two variants renamed to the same string,
-            // which serde rejects at compile time.
-            if !seen_values.insert(value.clone()) {
-                self.record(
-                    Severity::Dropped,
-                    context.to_string(),
-                    "enum value",
-                    format!("value `{value}` is listed twice; the repeat was dropped"),
-                );
-                continue;
-            }
-
-            let Some(variant) = to_variant_ident(&value) else {
-                self.record(
-                    Severity::Fatal,
-                    context.to_string(),
-                    "enum value",
-                    format!("enum value \"{value}\" has nothing a Rust name can be built from"),
-                );
-                continue;
-            };
-            if let Some(first) = taken_names.get(&variant) {
-                self.record(
-                    Severity::Fatal,
-                    context.to_string(),
-                    "enum value",
-                    format!(
-                        "enum values \"{first}\" and \"{value}\" would both become \
-                         the Rust enum variant `{variant}`"
-                    ),
-                );
-            } else {
-                taken_names.insert(variant.clone(), value.clone());
-            }
-            variants.push((variant, value));
-        }
-
-        Some(EnumDef {
-            name: to_type_ident(name)?,
+    Some((
+        EnumDef {
+            name: enum_name,
             variants,
-        })
-    }
+        },
+        diagnostics,
+    ))
+}
 
-    /// Record a diagnostic for a top-level schema whose kind the generator does not
-    /// turn into a type. `oneOf` member-level losses are reported inside
-    /// [`parse_one_of`]; this covers the schema-level drop.
-    pub(super) fn diagnose_unsupported_schema(&mut self, name: &str, schema: &Schema) {
-        let path = format!("components.schemas.{name}");
-        let (construct, reason): (&str, &str) = match &schema.schema_kind {
-            SchemaKind::AllOf { .. } => (
-                "allOf",
-                "allOf composition is not supported; no type was generated",
-            ),
-            SchemaKind::AnyOf { .. } => (
-                "anyOf",
-                "anyOf composition is not supported; no type was generated",
-            ),
-            SchemaKind::Not { .. } => (
-                "not",
-                "`not` schemas are not supported; no type was generated",
-            ),
-            SchemaKind::Any(_) => (
-                "free-form schema",
-                "free-form/ambiguous schema; no type was generated",
-            ),
-            SchemaKind::OneOf { .. } => (
-                "oneOf",
-                "oneOf has no usable local $ref members; no type was generated",
-            ),
-            SchemaKind::Type(Type::String(_)) => (
-                "string schema",
-                "top-level string type alias (or non-string enum) is not generated as a distinct type",
-            ),
-            SchemaKind::Type(Type::Integer(_)) => (
-                "integer schema",
-                "top-level integer schema (including integer enums) is not generated as a distinct type",
-            ),
-            SchemaKind::Type(Type::Number(_)) => (
-                "number schema",
-                "top-level number type alias is not generated as a distinct type",
-            ),
-            SchemaKind::Type(Type::Boolean(_)) => (
-                "boolean schema",
-                "top-level boolean type alias is not generated as a distinct type",
-            ),
-            SchemaKind::Type(Type::Array(_)) => (
-                "array schema",
-                "top-level array type alias is not generated as a distinct type",
-            ),
-            // Objects are always handled by `parse_schema`; nothing to report.
-            SchemaKind::Type(Type::Object(_)) => return,
-        };
-        self.record(Severity::Dropped, path, construct, reason);
-    }
+/// Report a top-level schema whose kind the generator does not turn into a
+/// type. `oneOf` member-level losses are reported inside [`super::one_of`];
+/// this covers the schema-level drop.
+pub(super) fn diagnose_unsupported_schema(name: &str, schema: &Schema) -> Option<Diagnostic> {
+    let (construct, reason): (&str, &str) = match &schema.schema_kind {
+        SchemaKind::AllOf { .. } => (
+            "allOf",
+            "allOf composition is not supported; no type was generated",
+        ),
+        SchemaKind::AnyOf { .. } => (
+            "anyOf",
+            "anyOf composition is not supported; no type was generated",
+        ),
+        SchemaKind::Not { .. } => (
+            "not",
+            "`not` schemas are not supported; no type was generated",
+        ),
+        SchemaKind::Any(_) => (
+            "free-form schema",
+            "free-form/ambiguous schema; no type was generated",
+        ),
+        SchemaKind::OneOf { .. } => (
+            "oneOf",
+            "oneOf has no usable local $ref members; no type was generated",
+        ),
+        SchemaKind::Type(Type::String(_)) => (
+            "string schema",
+            "top-level string type alias (or non-string enum) is not generated as a distinct type",
+        ),
+        SchemaKind::Type(Type::Integer(_)) => (
+            "integer schema",
+            "top-level integer schema (including integer enums) is not generated as a distinct type",
+        ),
+        SchemaKind::Type(Type::Number(_)) => (
+            "number schema",
+            "top-level number type alias is not generated as a distinct type",
+        ),
+        SchemaKind::Type(Type::Boolean(_)) => (
+            "boolean schema",
+            "top-level boolean type alias is not generated as a distinct type",
+        ),
+        SchemaKind::Type(Type::Array(_)) => (
+            "array schema",
+            "top-level array type alias is not generated as a distinct type",
+        ),
+        // Objects are always handled by `parse_schema`; nothing to report.
+        SchemaKind::Type(Type::Object(_)) => return None,
+    };
+    Some(Diagnostic::new(
+        Severity::Dropped,
+        format!("components.schemas.{name}"),
+        construct,
+        reason,
+    ))
+}
 
-    /// Map an OpenAPI schema to a Rust type string and nullable flag.
-    ///
-    /// Handles string (with date-time format), integer (i32/i64), number (f64),
-    /// boolean, and array types. Falls back to `serde_json::Value` for anything
-    /// else, recording a [`Severity::Degraded`] diagnostic at `context`.
-    fn map_schema_to_type(&mut self, schema: &Schema, context: &str) -> (String, bool) {
-        let nullable = schema.schema_data.nullable;
+/// Map an OpenAPI schema to a Rust type string and nullable flag.
+///
+/// Handles string (with date-time format), integer (i32/i64), number (f64),
+/// boolean, and array types. Falls back to `serde_json::Value` for anything
+/// else, reporting a [`Severity::Degraded`] diagnostic at `context`.
+fn map_schema_to_type(schema: &Schema, context: &str) -> (String, bool, Vec<Diagnostic>) {
+    let nullable = schema.schema_data.nullable;
 
-        match &schema.schema_kind {
-            SchemaKind::Type(Type::String(s)) => {
-                let ty = match &s.format {
-                    VariantOrUnknownOrEmpty::Item(StringFormat::DateTime) => "DateTime<Utc>",
-                    VariantOrUnknownOrEmpty::Item(StringFormat::Date) => "NaiveDate",
-                    VariantOrUnknownOrEmpty::Unknown(f) if f == "uuid" => "Uuid",
-                    _ => "String",
-                };
-                (ty.to_string(), nullable)
-            }
-            SchemaKind::Type(Type::Integer(i)) => {
-                let ty = match i.format {
-                    VariantOrUnknownOrEmpty::Item(IntegerFormat::Int32) => "i32",
-                    _ => "i64",
-                };
-                (ty.to_string(), nullable)
-            }
-            SchemaKind::Type(Type::Number(_)) => ("f64".to_string(), nullable),
-            SchemaKind::Type(Type::Boolean(_)) => ("bool".to_string(), nullable),
-            SchemaKind::Type(Type::Array(arr)) => {
-                let inner = match &arr.items {
-                    Some(ref_or) => {
-                        let (t, _) = self.resolve_field_type(ref_or, context);
-                        t
-                    }
-                    None => {
-                        self.record(
-                            Severity::Degraded,
-                            context.to_string(),
-                            "array without items",
-                            "array has no `items` schema; element type is `serde_json::Value`",
-                        );
-                        "serde_json::Value".to_string()
-                    }
-                };
-                (format!("Vec<{inner}>"), nullable)
-            }
-            other => {
-                self.record(
-                    Severity::Degraded,
-                    context.to_string(),
-                    describe_field_kind(other),
-                    "field type is not supported; generated as `serde_json::Value`",
-                );
-                ("serde_json::Value".to_string(), nullable)
-            }
+    match &schema.schema_kind {
+        SchemaKind::Type(Type::String(s)) => {
+            let ty = match &s.format {
+                VariantOrUnknownOrEmpty::Item(StringFormat::DateTime) => "DateTime<Utc>",
+                VariantOrUnknownOrEmpty::Item(StringFormat::Date) => "NaiveDate",
+                VariantOrUnknownOrEmpty::Unknown(f) if f == "uuid" => "Uuid",
+                _ => "String",
+            };
+            (ty.to_string(), nullable, Vec::new())
         }
-    }
-
-    /// Resolve a field's `ReferenceOr<Schema>` to a `(rust_type, nullable)` pair.
-    fn resolve_field_type(
-        &mut self,
-        field_ref: &ReferenceOr<Box<Schema>>,
-        context: &str,
-    ) -> (String, bool) {
-        match field_ref {
-            ReferenceOr::Reference { reference } => {
-                self.diagnose_ref(reference, context);
-                (self.ref_type_name(reference, context), false)
-            }
-            ReferenceOr::Item(schema) => self.map_schema_to_type(schema, context),
+        SchemaKind::Type(Type::Integer(i)) => {
+            let ty = match i.format {
+                VariantOrUnknownOrEmpty::Item(IntegerFormat::Int32) => "i32",
+                _ => "i64",
+            };
+            (ty.to_string(), nullable, Vec::new())
         }
-    }
-
-    /// Resolve a schema reference (used for parameters) to a `(rust_type, nullable)` pair.
-    pub(super) fn resolve_schema_ref(
-        &mut self,
-        schema_ref: &ReferenceOr<Schema>,
-        context: &str,
-    ) -> (String, bool) {
-        match schema_ref {
-            ReferenceOr::Reference { reference } => {
-                self.diagnose_ref(reference, context);
-                (self.ref_type_name(reference, context), false)
-            }
-            ReferenceOr::Item(schema) => self.map_schema_to_type(schema, context),
+        SchemaKind::Type(Type::Number(_)) => ("f64".to_string(), nullable, Vec::new()),
+        SchemaKind::Type(Type::Boolean(_)) => ("bool".to_string(), nullable, Vec::new()),
+        SchemaKind::Type(Type::Array(arr)) => {
+            let mut diagnostics = Vec::new();
+            let inner = match &arr.items {
+                Some(ref_or) => {
+                    let (ty, _, reported) = resolve_field_type(ref_or, context);
+                    diagnostics.extend(reported);
+                    ty
+                }
+                None => {
+                    record(
+                        &mut diagnostics,
+                        Severity::Degraded,
+                        context,
+                        "array without items",
+                        "array has no `items` schema; element type is `serde_json::Value`",
+                    );
+                    "serde_json::Value".to_string()
+                }
+            };
+            (format!("Vec<{inner}>"), nullable, diagnostics)
         }
+        other => (
+            "serde_json::Value".to_string(),
+            nullable,
+            vec![Diagnostic::new(
+                Severity::Degraded,
+                context,
+                describe_field_kind(other),
+                "field type is not supported; generated as `serde_json::Value`",
+            )],
+        ),
+    }
+}
+
+/// Resolve a field's `ReferenceOr<Schema>` to a `(rust_type, nullable)` pair.
+fn resolve_field_type(
+    field_ref: &ReferenceOr<Box<Schema>>,
+    context: &str,
+) -> (String, bool, Vec<Diagnostic>) {
+    match field_ref {
+        ReferenceOr::Reference { reference } => {
+            let mut diagnostics = Vec::new();
+            diagnostics.extend(diagnose_ref(reference, context));
+            let (name, reported) = ref_type_name(reference, context);
+            diagnostics.extend(reported);
+            (name, false, diagnostics)
+        }
+        ReferenceOr::Item(schema) => map_schema_to_type(schema, context),
+    }
+}
+
+/// Resolve a schema reference (used for parameters) to a `(rust_type, nullable)` pair.
+pub(super) fn resolve_schema_ref(
+    schema_ref: &ReferenceOr<Schema>,
+    context: &str,
+) -> (String, bool, Vec<Diagnostic>) {
+    match schema_ref {
+        ReferenceOr::Reference { reference } => {
+            let mut diagnostics = Vec::new();
+            diagnostics.extend(diagnose_ref(reference, context));
+            let (name, reported) = ref_type_name(reference, context);
+            diagnostics.extend(reported);
+            (name, false, diagnostics)
+        }
+        ReferenceOr::Item(schema) => map_schema_to_type(schema, context),
     }
 }
 
