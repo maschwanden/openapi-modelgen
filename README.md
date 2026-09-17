@@ -69,7 +69,7 @@ Sanitizing loses nothing (the value is still on the wire), so it is not reported
 Two naming cases are fatal:
 
 - A spec name with **nothing to build on** (the enum value `""`, a property or schema named `"!!!"` or `"_"`) leaves nothing to derive from.
-- A name **collision**: Two enum values can sanitize to the same variant (`a.b` and `a-b` both give `AB`, and so do `10min` and a literal `Variant10min`), as can two properties of one struct (`first-name` and `first.name`) or two schema names (`foo-bar` and `foo_bar`).
+- A name **collision**: Two enum values can sanitize to the same variant (`a.b` and `a-b` both give `AB`, and so do `10min` and a literal `Variant10min`), as can two properties of one struct (`first-name` and `first.name`) or two schema names (`foo-bar` and `foo_bar`). Schemas and operations share one namespace, so a query struct collides the same way: two operations with one `operationId`, or an `operationId` whose `...Query` name a schema already holds.
 
 ```
 error: code generation failed: 3 fatal problems in the spec
@@ -85,6 +85,16 @@ error: code generation failed: 3 fatal problems in the spec
 
 Fix the spec, then re-run. No files were written.
 ```
+
+An **inline enum** is the one exception. It has no name in the spec: the generator composes one from the struct and the property (`Greeting.language` gives `GreetingLanguage`). When that name is taken, the spec name wins, because a schema is what the user can rename, and the inline enum gets an `Inline` suffix instead:
+
+| Spec | Generated |
+| --- | --- |
+| schema `GreetingLanguage` + property `Greeting.language` | struct `GreetingLanguage`, enum `GreetingLanguageInline` |
+
+Two inline enums can also want one name, since the struct and the property run together (`Foo` + `barBaz` and `FooBar` + `baz` both give `FooBarBaz`). The suffix then marks whichever asked second. Either way the rename is reported as a diagnostic, since the name appears nowhere in the spec.
+
+One suffix deep only. With both names taken the generator has nothing left to derive from, so the clash is fatal like any other.
 
 A **`default` that its own type cannot hold** is fatal too, for the same reason turned around: there is no honest output. `default: 1.5` on an `integer`, `default: "not-a-date"` on a `date-time`, a value that overflows `int32`, or an `enum` default that is not one of the enum's values. Writing the default would put a value in the crate that the type cannot represent, and ignoring it would make the field required, which the spec never said. The run stops instead, naming every offending property at once:
 

@@ -27,6 +27,11 @@ const VARIANT_PREFIX: &str = "Variant";
 /// schema `3d-model` → `Type3dModel`.
 const TYPE_PREFIX: &str = "Type";
 
+/// Suffix for an inline enum whose struct-prefixed name is already taken, e.g.
+/// `Greeting.language` → `GreetingLanguageInline` when a schema holds
+/// `GreetingLanguage`. The schema keeps the name it was given in the spec.
+pub(crate) const INLINE_SUFFIX: &str = "Inline";
+
 /// Convert a `snake_case`, `kebab-case` or otherwise punctuated string to
 /// `PascalCase`.
 ///
