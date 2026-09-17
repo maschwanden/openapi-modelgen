@@ -75,6 +75,10 @@ Nothing is dropped or degraded silently. Each case records a `Diagnostic`:
 Prefer a fatal diagnostic over inventing a name. A name that appears nowhere in the spec is worse
 than a failed run, because the user cannot find it.
 
+One exception: an inline enum, which has no spec name to rename. Aborting would leave the user
+nothing to fix, so the spec name wins and the inline enum takes the `Inline` suffix, reported as
+`Degraded`. One suffix deep, then the rule above resumes.
+
 ## Writing Conventions
 
 Applies to everything written by hand: code comments, doc comments, Markdown, commit messages,

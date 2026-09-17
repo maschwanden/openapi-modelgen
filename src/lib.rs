@@ -1795,9 +1795,291 @@ components:
         let message = spec_error(yaml);
         assert!(
             message.contains(
-                r#"schemas "foo-bar" and "foo_bar" would both become the Rust type `FooBar`"#
+                r#"schema "foo-bar" and schema "foo_bar" would both become the Rust type `FooBar`"#
             ),
             "the error should name both schemas: {message}"
+        );
+
+        Ok(())
+    }
+
+    /// An `operationId` names a query struct the same way a schema name names a
+    /// struct, so two operations that share one collide. OpenAPI requires the id
+    /// to be unique, but nothing enforces it, and the output is two `pub struct
+    /// GetThingsQuery` items that do not compile.
+    #[test]
+    fn operations_sharing_an_operation_id_abort() -> Result<()> {
+        let yaml = r#"
+openapi: "3.0.3"
+info:
+  title: Test
+  version: "0.1.0"
+paths:
+  /a:
+    get:
+      operationId: getThings
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: OK
+  /b:
+    get:
+      operationId: getThings
+      parameters:
+        - name: offset
+          in: query
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: OK
+components:
+  schemas: {}
+"#;
+        let message = spec_error(yaml);
+        assert!(
+            message.contains(
+                "operation \"getThings\" (GET /a) and operation \"getThings\" (GET /b) \
+                 would both become the Rust type `GetThingsQuery`"
+            ),
+            "the error should name both operations: {message}"
+        );
+
+        Ok(())
+    }
+
+    /// A query struct shares one namespace with the schemas, so a schema can
+    /// claim the name an operation needs.
+    #[test]
+    fn a_query_struct_colliding_with_a_schema_aborts() -> Result<()> {
+        let yaml = r#"
+openapi: "3.0.3"
+info:
+  title: Test
+  version: "0.1.0"
+paths:
+  /a:
+    get:
+      operationId: getThings
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: OK
+components:
+  schemas:
+    GetThingsQuery:
+      type: object
+      properties:
+        a:
+          type: string
+"#;
+        let message = spec_error(yaml);
+        assert!(
+            message.contains(
+                "schema \"GetThingsQuery\" and operation \"getThings\" (GET /a) \
+                 would both become the Rust type `GetThingsQuery`"
+            ),
+            "the error should name the schema and the operation: {message}"
+        );
+
+        Ok(())
+    }
+
+    /// An inline enum has no name in the spec: the generator composes one from
+    /// the struct and the property. When a schema already holds that name, the
+    /// schema keeps it (it is the one the user can rename) and the inline enum
+    /// takes the `Inline` suffix. The `default` is what proves the new name
+    /// reached every writer, not just `model.rs`.
+    #[test]
+    fn an_inline_enum_takes_the_suffix_around_a_schema() -> Result<()> {
+        let yaml = r##"
+openapi: "3.0.3"
+info:
+  title: Test
+  version: "0.1.0"
+paths: {}
+components:
+  schemas:
+    GreetingLanguage:
+      type: object
+      properties:
+        code:
+          type: string
+    Greeting:
+      type: object
+      properties:
+        language:
+          type: string
+          enum: [en, de]
+          default: en
+"##;
+        let crate_ = generate(&load_spec(yaml)?, &test_config())?;
+
+        let model = file_content(&crate_, "src/model.rs");
+        assert!(
+            model.contains(
+                "\
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum GreetingLanguageInline {
+    #[serde(rename = \"en\")]
+    En,
+    #[serde(rename = \"de\")]
+    De,
+}
+"
+            ),
+            "the inline enum should take the suffix: {model}"
+        );
+        assert!(
+            model.contains(
+                "\
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GreetingLanguage {
+    pub code: Option<String>,
+}
+"
+            ),
+            "the schema should keep its own name: {model}"
+        );
+        assert!(
+            model.contains("pub language: GreetingLanguageInline,"),
+            "the field should name the suffixed enum: {model}"
+        );
+
+        let defaults = file_content(&crate_, "src/default.rs");
+        assert!(
+            defaults.contains(
+                "\
+pub fn greeting_language() -> GreetingLanguageInline {
+    GreetingLanguageInline::En
+}
+"
+            ),
+            "the default fn should name the suffixed enum: {defaults}"
+        );
+
+        let validation = file_content(&crate_, "src/validation.rs");
+        assert!(
+            validation.contains("impl Validation for GreetingLanguageInline {}"),
+            "the Validation impl should name the suffixed enum: {validation}"
+        );
+
+        let renamed: Vec<&Diagnostic> = crate_
+            .diagnostics
+            .iter()
+            .filter(|d| d.construct == "inline enum")
+            .collect();
+        assert_eq!(renamed.len(), 1, "{:?}", crate_.diagnostics);
+        assert_eq!(renamed[0].severity, Severity::Degraded);
+        assert_eq!(renamed[0].path, "Greeting.language");
+        assert_eq!(
+            renamed[0].reason,
+            "`GreetingLanguage` is taken by another type; \
+             the inline enum was named `GreetingLanguageInline` instead"
+        );
+
+        Ok(())
+    }
+
+    /// Two inline enums can want one name too, since the struct and the
+    /// property run together (`Foo` + `barBaz` and `FooBar` + `baz` both give
+    /// `FooBarBaz`). The suffix then marks whichever asked second.
+    #[test]
+    fn two_inline_enums_that_want_one_name() -> Result<()> {
+        let yaml = r##"
+openapi: "3.0.3"
+info:
+  title: Test
+  version: "0.1.0"
+paths: {}
+components:
+  schemas:
+    Foo:
+      type: object
+      properties:
+        barBaz:
+          type: string
+          enum: [a, b]
+    FooBar:
+      type: object
+      properties:
+        baz:
+          type: string
+          enum: [c, d]
+"##;
+        let crate_ = generate(&load_spec(yaml)?, &test_config())?;
+
+        let model = file_content(&crate_, "src/model.rs");
+        assert!(
+            model.contains("pub enum FooBarBaz {"),
+            "the first inline enum keeps the composed name: {model}"
+        );
+        assert!(
+            model.contains("pub enum FooBarBazInline {"),
+            "the second takes the suffix: {model}"
+        );
+        assert!(model.contains("pub bar_baz: Option<FooBarBaz>,"), "{model}");
+        assert!(
+            model.contains("pub baz: Option<FooBarBazInline>,"),
+            "{model}"
+        );
+
+        let renamed: Vec<&Diagnostic> = crate_
+            .diagnostics
+            .iter()
+            .filter(|d| d.construct == "inline enum")
+            .collect();
+        assert_eq!(renamed.len(), 1, "{:?}", crate_.diagnostics);
+        assert_eq!(renamed[0].path, "FooBar.baz");
+
+        Ok(())
+    }
+
+    /// One suffix deep only. With both names taken the generator has nothing
+    /// left to derive from, and a third invented name would appear nowhere in
+    /// the spec, so the clash is fatal like any other.
+    #[test]
+    fn an_inline_enum_with_both_names_taken_aborts() -> Result<()> {
+        let yaml = r##"
+openapi: "3.0.3"
+info:
+  title: Test
+  version: "0.1.0"
+paths: {}
+components:
+  schemas:
+    GreetingLanguage:
+      type: object
+      properties:
+        code:
+          type: string
+    GreetingLanguageInline:
+      type: object
+      properties:
+        code:
+          type: string
+    Greeting:
+      type: object
+      properties:
+        language:
+          type: string
+          enum: [en, de]
+"##;
+        let message = spec_error(yaml);
+        assert!(
+            message.contains(
+                "`GreetingLanguage` and `GreetingLanguageInline` are both taken; \
+                 rename the schema or the property"
+            ),
+            "the error should name both candidates: {message}"
         );
 
         Ok(())

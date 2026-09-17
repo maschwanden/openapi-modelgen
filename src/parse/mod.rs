@@ -16,7 +16,7 @@ mod schema;
 #[cfg(test)]
 mod testutil;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use openapiv3::{OpenAPI, Operation, ReferenceOr};
 
@@ -35,13 +35,12 @@ pub fn parse(spec: &OpenAPI) -> (Vec<Entity>, Vec<Diagnostic>) {
     let mut entities = Vec::new();
     let mut diagnostics = Vec::new();
 
+    // Rust type name → the spec construct that claimed it. Every generated type
+    // is named from a schema or from an operation, so one map catches every
+    // pair that would emit two items under one name. See [`claim_type_name`].
+    let mut type_names: HashMap<String, String> = HashMap::new();
+
     if let Some(components) = &spec.components {
-        // Schema names are sanitized into Rust type names, so two schemas can
-        // land on the same one (`foo-bar` and `foo_bar` both give `FooBar`).
-        // Neither generating both nor picking one is defensible, since the
-        // `$ref`s to them are indistinguishable, so the clash is fatal.
-        let mut type_names: std::collections::HashMap<String, String> =
-            std::collections::HashMap::new();
         for (name, ref_or) in &components.schemas {
             let schema = match ref_or {
                 ReferenceOr::Item(schema) => schema,
@@ -69,20 +68,13 @@ pub fn parse(spec: &OpenAPI) -> (Vec<Entity>, Vec<Diagnostic>) {
                 );
                 continue;
             };
-            if let Some(first) = type_names.get(&type_name) {
-                record(
-                    &mut diagnostics,
-                    Severity::Fatal,
-                    format!("components.schemas.{name}"),
-                    "schema",
-                    format!(
-                        "schemas \"{first}\" and \"{name}\" would both become \
-                         the Rust type `{type_name}`"
-                    ),
-                );
-            } else {
-                type_names.insert(type_name.clone(), name.clone());
-            }
+            diagnostics.extend(claim_type_name(
+                &mut type_names,
+                &type_name,
+                format!("schema \"{name}\""),
+                format!("components.schemas.{name}"),
+                "schema",
+            ));
 
             // Each arm returns its own diagnostics, so the one that produces the
             // entity is the only one whose reports are kept.
@@ -137,6 +129,18 @@ pub fn parse(spec: &OpenAPI) -> (Vec<Entity>, Vec<Diagnostic>) {
                 operation::parse_query(op, spec.components.as_ref(), method, path);
             diagnostics.extend(reported);
             if let Some(entity) = entity {
+                // A query struct is named from the `operationId` (or the path),
+                // so it clashes with a schema, or with another operation, the
+                // same way two schemas clash.
+                if let Entity::Struct(s) = &entity {
+                    diagnostics.extend(claim_type_name(
+                        &mut type_names,
+                        &s.name,
+                        operation_origin(op, method, path),
+                        format!("{} {path}", method.to_uppercase()),
+                        "operation",
+                    ));
+                }
                 entities.push(entity);
             }
         }
@@ -160,6 +164,46 @@ pub fn parse(spec: &OpenAPI) -> (Vec<Entity>, Vec<Diagnostic>) {
     ));
 
     (entities, diagnostics)
+}
+
+/// Claim a Rust type name for one spec construct, or report the clash.
+///
+/// Spec names are sanitized into Rust type names, so two constructs can land on
+/// the same one: `foo-bar` and `foo_bar` both give `FooBar`, and two operations
+/// that share an `operationId` both give one query struct. Neither generating
+/// both nor picking one is defensible, since a `$ref` to either is
+/// indistinguishable in the output, so the clash is fatal.
+///
+/// `origin` names the claiming construct (`schema "foo-bar"`) and is what a
+/// later clash quotes back, so both sides of the pair are in the message.
+fn claim_type_name(
+    type_names: &mut HashMap<String, String>,
+    type_name: &str,
+    origin: String,
+    path: String,
+    construct: &'static str,
+) -> Option<Diagnostic> {
+    match type_names.get(type_name) {
+        Some(first) => Some(Diagnostic::new(
+            Severity::Fatal,
+            path,
+            construct,
+            format!("{first} and {origin} would both become the Rust type `{type_name}`"),
+        )),
+        None => {
+            type_names.insert(type_name.to_string(), origin);
+            None
+        }
+    }
+}
+
+/// How a diagnostic names the operation a query struct came from.
+fn operation_origin(op: &Operation, method: &str, path: &str) -> String {
+    let location = format!("{} {path}", method.to_uppercase());
+    match &op.operation_id {
+        Some(id) => format!("operation \"{id}\" ({location})"),
+        None => format!("operation {location}"),
+    }
 }
 
 /// Report fields typed with something that was never generated.

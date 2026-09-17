@@ -4,7 +4,7 @@ use crate::{
     Config, Constraints, Diagnostic, Entity, EntityKind, EnumDef, Field, GeneratedCrate,
     GeneratedFile, StructDef, UnionDef,
     diagnostic::{Severity, record},
-    ident::{assert_ident, escape_keyword, to_field_ident, to_snake_case},
+    ident::{INLINE_SUFFIX, assert_ident, escape_keyword, to_field_ident, to_snake_case},
 };
 
 /// Generate a complete crate from a list of parsed entities.
@@ -30,11 +30,14 @@ pub fn write(entities: &[Entity], config: &Config) -> Result<GeneratedCrate, std
         .clone()
         .any(|fields| fields.iter().any(|f| f.rust_type == "Uuid"));
 
-    let (enum_name_map, _) = resolve_inline_enums(entities);
+    // Named once, not per writer: naming reports a diagnostic when an inline
+    // enum has to step aside, and three calls would report it three times.
+    let (enum_name_map, inline_enums, mut diagnostics) = resolve_inline_enums(entities);
 
     // Resolve every field's Rust identifier once: model.rs, default.rs and
     // validation.rs must all spell the same field the same way.
-    let (field_idents, diagnostics) = resolve_field_idents(entities);
+    let (field_idents, reported) = resolve_field_idents(entities);
+    diagnostics.extend(reported);
     // Render every field default once; both model.rs and default.rs consume the
     // result.
     let default_literals = compute_default_literals(entities, &enum_name_map);
@@ -54,11 +57,17 @@ pub fn write(entities: &[Entity], config: &Config) -> Result<GeneratedCrate, std
         },
         GeneratedFile {
             path: "src/validation.rs",
-            content: write_validation_rs(entities, needs_regex, &field_idents)?,
+            content: write_validation_rs(entities, needs_regex, &field_idents, &inline_enums)?,
         },
         GeneratedFile {
             path: "src/model.rs",
-            content: write_model_rs(entities, &enum_name_map, &default_literals, &field_idents)?,
+            content: write_model_rs(
+                entities,
+                &enum_name_map,
+                &default_literals,
+                &field_idents,
+                &inline_enums,
+            )?,
         },
     ];
 
@@ -76,10 +85,9 @@ fn header_comment() -> &'static str {
     "This file is @generated. Do not edit manually."
 }
 
-/// Collect deduplicated inline enum names from struct entities.
-///
-/// Returns a map from `(entity_name, raw_enum_name)` → resolved prefixed name,
-/// plus a vec of `(resolved_name, &EnumDef)` for the unique enums to emit.
+/// The name each inline enum is emitted with, keyed by `(struct name, raw enum
+/// name)`. Assigned by [`resolve_inline_enums`], which is also where a name
+/// that is not simply the two halves run together is explained.
 type EnumNameMap = std::collections::HashMap<(String, String), String>;
 
 /// Rust identifier for each field, keyed by `(struct name, spec field name)`.
@@ -228,33 +236,112 @@ fn resolved_type(struct_name: &str, field: &Field, enum_name_map: &EnumNameMap) 
         .unwrap_or_else(|| field.rust_type.clone())
 }
 
-fn resolve_inline_enums(entities: &[Entity]) -> (EnumNameMap, Vec<(String, &EnumDef)>) {
+/// Name every inline enum, and report the ones that had to step aside.
+///
+/// An inline enum has no name of its own in the spec, so the generator composes
+/// one from the struct and the property (`Greeting.language` →
+/// `GreetingLanguage`). That name can already be taken, by a schema or by an
+/// earlier inline enum, and emitting it twice does not compile. The spec name
+/// wins and the inline enum takes [`INLINE_SUFFIX`] instead, since a schema can
+/// be renamed and an inline enum cannot. One suffix deep only: with both names
+/// taken there is nothing left to derive from, so the clash is fatal like any
+/// other.
+fn resolve_inline_enums(
+    entities: &[Entity],
+) -> (EnumNameMap, Vec<(String, &EnumDef)>, Vec<Diagnostic>) {
     let mut enum_name_map: EnumNameMap = EnumNameMap::new();
     let mut final_enums: Vec<(String, &EnumDef)> = Vec::new();
     let mut variants_to_name: std::collections::HashMap<Vec<String>, String> =
         std::collections::HashMap::new();
+    let mut diagnostics = Vec::new();
+    // Every name already spoken for: the entities, plus the inline enums named
+    // so far. An inline enum asks last, so it never displaces a spec name.
+    let mut taken: std::collections::HashSet<String> = entities
+        .iter()
+        .map(|entity| match entity {
+            Entity::Struct(s) => s.name.clone(),
+            Entity::Enum(e) => e.name.clone(),
+            Entity::Union(u) => u.name.clone(),
+        })
+        .collect();
 
     for entity in entities {
         if let Entity::Struct(s) = entity {
             for enum_def in &s.enums {
                 let variants: Vec<String> = enum_def.variants.iter().map(|p| p.1.clone()).collect();
 
+                // A shared variant set reuses the name already assigned to it,
+                // so it claims nothing and cannot clash.
                 if let Some(existing_name) = variants_to_name.get(&variants) {
                     enum_name_map.insert(
                         (s.name.clone(), enum_def.name.clone()),
                         existing_name.clone(),
                     );
-                } else {
-                    let prefixed = format!("{}{}", s.name, enum_def.name);
-                    enum_name_map.insert((s.name.clone(), enum_def.name.clone()), prefixed.clone());
-                    variants_to_name.insert(variants, prefixed.clone());
-                    final_enums.push((prefixed, enum_def));
+                    continue;
                 }
+
+                let prefixed = format!("{}{}", s.name, enum_def.name);
+                let name = match inline_enum_name(&prefixed, &taken) {
+                    Some(name) => name,
+                    None => {
+                        record(
+                            &mut diagnostics,
+                            Severity::Fatal,
+                            inline_enum_path(s, enum_def),
+                            "inline enum",
+                            format!(
+                                "`{prefixed}` and `{prefixed}{INLINE_SUFFIX}` are both taken; \
+                                 rename the schema or the property"
+                            ),
+                        );
+                        continue;
+                    }
+                };
+                if name != prefixed {
+                    record(
+                        &mut diagnostics,
+                        Severity::Degraded,
+                        inline_enum_path(s, enum_def),
+                        "inline enum",
+                        format!(
+                            "`{prefixed}` is taken by another type; \
+                             the inline enum was named `{name}` instead"
+                        ),
+                    );
+                }
+
+                taken.insert(name.clone());
+                enum_name_map.insert((s.name.clone(), enum_def.name.clone()), name.clone());
+                variants_to_name.insert(variants, name.clone());
+                final_enums.push((name, enum_def));
             }
         }
     }
 
-    (enum_name_map, final_enums)
+    (enum_name_map, final_enums, diagnostics)
+}
+
+/// The name an inline enum gets: its composed name, then the suffixed one, then
+/// nothing.
+fn inline_enum_name(prefixed: &str, taken: &std::collections::HashSet<String>) -> Option<String> {
+    [prefixed.to_string(), format!("{prefixed}{INLINE_SUFFIX}")]
+        .into_iter()
+        .find(|candidate| !taken.contains(candidate))
+}
+
+/// Where an inline enum lives in the spec, for a diagnostic.
+///
+/// The enum is named after the property that declares it, so the property is
+/// what the map back to the spec goes through.
+fn inline_enum_path(s: &StructDef, enum_def: &EnumDef) -> String {
+    match s
+        .fields
+        .iter()
+        .find(|f| f.is_inline_enum && f.rust_type == enum_def.name)
+    {
+        Some(field) => format!("{}.{}", s.name, field.name),
+        None => s.name.clone(),
+    }
 }
 
 fn write_enum(out: &mut String, name: &str, enum_def: &EnumDef) -> std::fmt::Result {
@@ -305,6 +392,7 @@ fn write_model_rs(
     enum_name_map: &EnumNameMap,
     default_literals: &DefaultLiterals,
     field_idents: &FieldIdents,
+    inline_enums: &[(String, &EnumDef)],
 ) -> Result<String, std::fmt::Error> {
     let struct_fields = entities.iter().filter_map(|e| match e {
         Entity::Struct(s) => Some(&s.fields),
@@ -328,8 +416,6 @@ fn write_model_rs(
     };
     let uuid_import = if needs_uuid { "\nuse uuid::Uuid;" } else { "" };
 
-    let (_, final_enums) = resolve_inline_enums(entities);
-
     let header = header_comment();
     let mut out = format!(
         "\
@@ -345,7 +431,7 @@ use serde::{{Deserialize, Serialize}};{uuid_import}
             write_enum(&mut out, &enum_def.name, enum_def)?;
         }
     }
-    for (enum_name, enum_def) in &final_enums {
+    for (enum_name, enum_def) in inline_enums {
         write_enum(&mut out, enum_name, enum_def)?;
     }
 
@@ -568,6 +654,7 @@ fn write_validation_rs(
     entities: &[Entity],
     needs_regex: bool,
     field_idents: &FieldIdents,
+    inline_enums: &[(String, &EnumDef)],
 ) -> Result<String, std::fmt::Error> {
     // Import order matches rustfmt's alphabetical sort: crate < regex.
     let imports = if needs_regex {
@@ -620,8 +707,6 @@ impl<T: Validation> Validation for Vec<T> {{
 "
     );
 
-    let (_, inline_enums) = resolve_inline_enums(entities);
-
     for entity in entities {
         match entity {
             Entity::Struct(s) => write_validation_impl(&mut out, s, field_idents)?,
@@ -633,7 +718,7 @@ impl<T: Validation> Validation for Vec<T> {{
         }
     }
 
-    for (enum_name, _) in &inline_enums {
+    for (enum_name, _) in inline_enums {
         writeln!(out)?;
         writeln!(out, "impl Validation for {} {{}}", assert_ident(enum_name))?;
     }
@@ -1232,7 +1317,6 @@ pub use validation::{{Validation, ValidationError}};
     )
 }
 
-/// Escape a name with `r#` if it is a Rust keyword.
 #[cfg(test)]
 mod tests {
     use super::*;
