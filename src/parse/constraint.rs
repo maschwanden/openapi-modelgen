@@ -1,5 +1,3 @@
-//! Validation keywords to the [`Constraints`] a field carries.
-
 use openapiv3::{Schema, SchemaKind, Type};
 
 use crate::Constraints;

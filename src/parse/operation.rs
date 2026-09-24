@@ -423,7 +423,9 @@ components:
     }
 
     /// A `$ref` request body and a `$ref` response schema point at components we
-    /// generate: no loss, no diagnostic. (Regression for the false-positive.)
+    /// generate: no loss, no diagnostic. Reporting one here would blame the
+    /// operation for a type that was generated after all, and `--strict` would
+    /// then fail a spec that lost nothing.
     #[test]
     fn diagnostic_ref_bodies_are_clean() -> Result<()> {
         let diags = diagnostics_for(&format!(

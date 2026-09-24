@@ -86,8 +86,10 @@ fn header_comment() -> &'static str {
 }
 
 /// The name each inline enum is emitted with, keyed by `(struct name, raw enum
-/// name)`. Assigned by [`resolve_inline_enums`], which is also where a name
-/// that is not simply the two halves run together is explained.
+/// name)`. Usually the two halves of the key run together (`Greeting` +
+/// `language` → `GreetingLanguage`); an enum whose composed name a schema
+/// already holds is emitted with [`INLINE_SUFFIX`] appended instead. Every
+/// entry is assigned by [`resolve_inline_enums`].
 type EnumNameMap = std::collections::HashMap<(String, String), String>;
 
 /// Rust identifier for each field, keyed by `(struct name, spec field name)`.
@@ -321,8 +323,9 @@ fn resolve_inline_enums(
     (enum_name_map, final_enums, diagnostics)
 }
 
-/// The name an inline enum gets: its composed name, then the suffixed one, then
-/// nothing.
+/// The first name for an inline enum that nothing in `taken` has claimed:
+/// `prefixed` (the struct and property names run together), then `prefixed`
+/// with [`INLINE_SUFFIX`] appended, then `None` when both are already in use.
 fn inline_enum_name(prefixed: &str, taken: &std::collections::HashSet<String>) -> Option<String> {
     [prefixed.to_string(), format!("{prefixed}{INLINE_SUFFIX}")]
         .into_iter()

@@ -56,8 +56,9 @@ pub struct Diagnostic {
 impl Diagnostic {
     /// Build a report of a construct that was not fully generated.
     ///
-    /// Every diagnostic in the crate is built here, so a caller that returns
-    /// one and a caller that pushes one through [`record`] cannot drift apart.
+    /// This is the only constructor: a caller that returns a diagnostic and a
+    /// caller that pushes one onto a list (through [`record`], which calls
+    /// this) build the same value, so the two paths cannot drift apart.
     pub(crate) fn new(
         severity: Severity,
         path: impl Into<String>,
@@ -88,10 +89,11 @@ impl fmt::Display for Diagnostic {
 
 /// Record a diagnostic by pushing it onto the caller's own list.
 ///
-/// A function that reports more than one loss accumulates them here and returns
-/// the list; one that reports at most one returns a [`Diagnostic::new`] instead.
-/// Recording never logs, which would double-print on the CLI, since that renders
-/// its own summary from the returned list.
+/// A function that reports more than one loss accumulates them in a list of its
+/// own and returns it; one that reports at most a single loss builds that
+/// [`Diagnostic`] and returns it directly instead. Recording never logs: the
+/// CLI renders its own summary from the returned list, so a log line here would
+/// print every diagnostic twice.
 pub(crate) fn record(
     diagnostics: &mut Vec<Diagnostic>,
     severity: Severity,

@@ -103,7 +103,9 @@ pub(super) fn spec_with_composite_spec(composite_yaml: &str) -> Result<OpenAPI> 
     Ok(load_spec(&full)?)
 }
 
-/// Same as [`spec_with_composite_spec`] but returns the parsed entities.
+/// Build a spec with `Cat`/`Dog` object schemas plus a caller-supplied
+/// composite schema, parse it, and return the entities.
+/// [`spec_with_composite_spec`] stops at the loaded `OpenAPI`.
 pub(super) fn spec_with_composite(composite_yaml: &str) -> Result<Vec<Entity>> {
     let (entities, _) = parse(&spec_with_composite_spec(composite_yaml)?);
     Ok(entities)
